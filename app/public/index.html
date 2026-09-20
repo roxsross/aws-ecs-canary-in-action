@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ECS Canary in Action · Monitor de tráfico</title>
+    <meta
+      name="description"
+      content="Monitor en vivo del reparto de tráfico entre la versión estable y la canary en Amazon ECS."
+    />
+    <link rel="stylesheet" href="/styles.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%230b1024'/%3E%3Cpath d='M6 20h8l4-10 4 10h4' stroke='%2322d3ee' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"
+    />
+  </head>
+  <body data-state="booting">
+    <a class="skip-link" href="#main">Saltar al contenido</a>
+
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 40 40" role="presentation">
+            <defs>
+              <linearGradient id="markGradient" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="#22d3ee" />
+                <stop offset="100%" stop-color="#f472b6" />
+              </linearGradient>
+            </defs>
+            <circle cx="20" cy="20" r="18" fill="none" stroke="url(#markGradient)" stroke-width="2" />
+            <path
+              d="M9 25h6l5-12 5 12h6"
+              fill="none"
+              stroke="url(#markGradient)"
+              stroke-width="2.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </span>
+        <span class="brand-text">
+          <strong>ECS Canary in Action</strong>
+          <small>Monitor de tráfico en vivo · <span data-bind="project">canary-lab</span></small>
+        </span>
+      </div>
+
+      <div class="topbar-meta">
+        <p class="served-by" role="status" aria-live="polite">
+          Esta página la sirvió
+          <span class="chip" data-bind="servedByChip" data-track="stable">
+            <span class="chip-dot" aria-hidden="true"></span>
+            <span data-bind="servedByLabel">STABLE</span>
+            <span class="chip-version" data-bind="servedByVersion">1.0.0</span>
+          </span>
+          <span class="mono muted" data-bind="servedByTask">task ·</span>
+        </p>
+        <p class="env-meta mono muted">
+          <span data-bind="region">us-east-1</span>
+          <span aria-hidden="true">·</span>
+          <span data-bind="persistence">memory</span>
+          <span aria-hidden="true">·</span>
+          <span data-bind="cluster">sin cluster</span>
+        </p>
+      </div>
+
+      <div class="topbar-actions">
+        <button type="button" class="btn btn-ghost" data-action="toggle-probes" aria-pressed="true">
+          <span class="live-dot" aria-hidden="true"></span>
+          <span data-bind="probeToggleLabel">Pausar sondas</span>
+        </button>
+        <button type="button" class="btn btn-ghost" data-action="reset">Reiniciar contadores</button>
+      </div>
+    </header>
+
+    <main id="main">
+      <!-- ---------------------------------------------------------- hero split -->
+      <section class="panel panel-hero" aria-labelledby="split-title">
+        <div class="panel-head">
+          <h2 id="split-title">Reparto de tráfico</h2>
+          <p class="panel-sub" data-bind="phase">Esperando datos…</p>
+        </div>
+
+        <div class="split-grid">
+          <article class="split-row" data-source="alb">
+            <header>
+              <h3>Peso configurado en el ALB</h3>
+              <p class="hint">La intención del despliegue (listener rule)</p>
+            </header>
+            <div
+              class="bar"
+              role="img"
+              aria-label="Peso configurado en el balanceador"
+              data-bind="albBar"
+            >
+              <span class="bar-seg" data-track="stable" style="width: 100%">
+                <span class="bar-label"><b data-bind="albStable">100%</b> estable</span>
+              </span>
+              <span class="bar-seg" data-track="canary" style="width: 0%">
+                <span class="bar-label"><b data-bind="albCanary">0%</b> canary</span>
+              </span>
+            </div>
+            <p class="row-note mono muted" data-bind="albNote">peso stable=100 canary=0</p>
+          </article>
+
+          <article class="split-row" data-source="observed">
+            <header>
+              <h3>Observado por tu navegador</h3>
+              <p class="hint">Sondas reales a <code>/api/hit</code> desde esta pestaña</p>
+            </header>
+            <div
+              class="bar"
+              role="img"
+              aria-label="Reparto observado por este navegador"
+              data-bind="observedBar"
+            >
+              <span class="bar-seg" data-track="stable" style="width: 100%">
+                <span class="bar-label"><b data-bind="observedStable">0%</b> estable</span>
+              </span>
+              <span class="bar-seg" data-track="canary" style="width: 0%">
+                <span class="bar-label"><b data-bind="observedCanary">0%</b> canary</span>
+              </span>
+            </div>
+            <p class="row-note mono muted" data-bind="observedNote">0 sondas</p>
+          </article>
+
+          <article class="split-row" data-source="global">
+            <header>
+              <h3>Global (todas las tareas)</h3>
+              <p class="hint">Contadores compartidos en DynamoDB</p>
+            </header>
+            <div
+              class="bar"
+              role="img"
+              aria-label="Reparto global registrado en DynamoDB"
+              data-bind="globalBar"
+            >
+              <span class="bar-seg" data-track="stable" style="width: 100%">
+                <span class="bar-label"><b data-bind="globalStable">0%</b> estable</span>
+              </span>
+              <span class="bar-seg" data-track="canary" style="width: 0%">
+                <span class="bar-label"><b data-bind="globalCanary">0%</b> canary</span>
+              </span>
+            </div>
+            <p class="row-note mono muted" data-bind="globalNote">0 solicitudes registradas</p>
+          </article>
+        </div>
+
+        <div class="barcode-wrap">
+          <div class="barcode-head">
+            <h3>Últimas sondas</h3>
+            <p class="hint">
+              Cada marca es una solicitud: color por versión, rojo si respondió 5xx
+            </p>
+          </div>
+          <div
+            class="barcode"
+            data-bind="barcode"
+            role="img"
+            aria-label="Tira de las últimas solicitudes coloreadas por versión"
+          ></div>
+        </div>
+      </section>
+
+      <!-- ------------------------------------------------------- version cards -->
+      <section class="cards" aria-label="Versiones desplegadas">
+        <article class="card" data-track="stable" data-bind="card-stable">
+          <header class="card-head">
+            <span class="card-badge">
+              <span class="card-dot" aria-hidden="true"></span>
+              versión estable
+            </span>
+            <span class="card-version mono" data-bind="stableVersion">—</span>
+          </header>
+          <dl class="card-metrics">
+            <div>
+              <dt>Solicitudes</dt>
+              <dd class="mono big" data-bind="stableHits">0</dd>
+            </div>
+            <div>
+              <dt>Errores</dt>
+              <dd class="mono big" data-bind="stableErrors">0</dd>
+            </div>
+            <div>
+              <dt>Tasa de error</dt>
+              <dd class="mono big" data-bind="stableErrorRate">0%</dd>
+            </div>
+            <div>
+              <dt>Latencia media</dt>
+              <dd class="mono big" data-bind="stableLatency">0 ms</dd>
+            </div>
+          </dl>
+          <svg class="sparkline" data-bind="stableSpark" viewBox="0 0 240 48" aria-hidden="true">
+            <path class="spark-area" d="" />
+            <path class="spark-line" d="" />
+          </svg>
+          <footer class="card-foot">
+            <span class="mono muted" data-bind="stableTasks">sin tareas vistas</span>
+            <a class="link" href="?track=stable" data-bind="stableForceLink">ver solo esta versión</a>
+          </footer>
+        </article>
+
+        <article class="card" data-track="canary" data-bind="card-canary">
+          <header class="card-head">
+            <span class="card-badge">
+              <span class="card-dot" aria-hidden="true"></span>
+              versión canary
+            </span>
+            <span class="card-version mono" data-bind="canaryVersion">—</span>
+          </header>
+          <dl class="card-metrics">
+            <div>
+              <dt>Solicitudes</dt>
+              <dd class="mono big" data-bind="canaryHits">0</dd>
+            </div>
+            <div>
+              <dt>Errores</dt>
+              <dd class="mono big" data-bind="canaryErrors">0</dd>
+            </div>
+            <div>
+              <dt>Tasa de error</dt>
+              <dd class="mono big" data-bind="canaryErrorRate">0%</dd>
+            </div>
+            <div>
+              <dt>Latencia media</dt>
+              <dd class="mono big" data-bind="canaryLatency">0 ms</dd>
+            </div>
+          </dl>
+          <svg class="sparkline" data-bind="canarySpark" viewBox="0 0 240 48" aria-hidden="true">
+            <path class="spark-area" d="" />
+            <path class="spark-line" d="" />
+          </svg>
+          <footer class="card-foot">
+            <span class="mono muted" data-bind="canaryTasks">sin tareas vistas</span>
+            <a class="link" href="?track=canary" data-bind="canaryForceLink">ver solo esta versión</a>
+          </footer>
+        </article>
+      </section>
+
+      <!-- ------------------------------------------------------------- timeline -->
+      <section class="panel" aria-labelledby="timeline-title">
+        <div class="panel-head">
+          <h2 id="timeline-title">Solicitudes por minuto</h2>
+          <div class="legend" aria-hidden="true">
+            <span class="legend-item" data-track="stable">estable</span>
+            <span class="legend-item" data-track="canary">canary</span>
+            <span class="legend-item" data-track="error">5xx</span>
+          </div>
+        </div>
+        <div class="chart-wrap">
+          <svg
+            class="chart"
+            data-bind="chart"
+            viewBox="0 0 960 260"
+            preserveAspectRatio="none"
+            role="img"
+            aria-labelledby="timeline-title"
+            aria-describedby="timeline-summary"
+          >
+            <g data-bind="chartGrid"></g>
+            <g data-bind="chartBars"></g>
+          </svg>
+          <p class="sr-only" id="timeline-summary" data-bind="chartSummary">Sin datos todavía.</p>
+        </div>
+      </section>
+
+      <!-- ------------------------------------------------- feed + control room -->
+      <div class="split-columns">
+        <section class="panel" aria-labelledby="feed-title">
+          <div class="panel-head">
+            <h2 id="feed-title">Flujo de solicitudes</h2>
+            <p class="panel-sub" data-bind="feedSource">origen: local</p>
+          </div>
+          <ol class="feed" data-bind="feed" aria-live="off"></ol>
+        </section>
+
+        <section class="panel panel-controls" aria-labelledby="controls-title">
+          <div class="panel-head">
+            <h2 id="controls-title">Sala de control</h2>
+            <p class="panel-sub">Genera tráfico y rompe la canary a propósito</p>
+          </div>
+
+          <div class="control-block">
+            <label class="control-label" for="rate">
+              Sondas por segundo
+              <output class="mono" data-bind="rateOut" for="rate">4</output>
+            </label>
+            <input id="rate" type="range" min="0" max="25" step="1" value="4" />
+            <p class="hint">
+              Sube el ritmo para que el reparto converja al peso configurado en el ALB.
+            </p>
+          </div>
+
+          <div class="control-block">
+            <span class="control-label" id="pin-label">Enviar sondas a</span>
+            <div class="segmented" role="radiogroup" aria-labelledby="pin-label">
+              <button type="button" role="radio" aria-checked="true" data-pin="auto">
+                Reparto del ALB
+              </button>
+              <button type="button" role="radio" aria-checked="false" data-pin="stable">
+                Solo estable
+              </button>
+              <button type="button" role="radio" aria-checked="false" data-pin="canary">
+                Solo canary
+              </button>
+            </div>
+            <p class="hint">
+              Forzar una versión usa reglas del listener (<code>?track=</code>), sin tocar los pesos.
+            </p>
+          </div>
+
+          <div class="control-block chaos" data-bind="chaosBlock">
+            <span class="control-label" id="chaos-label">
+              Inyección de fallos
+              <span class="tag" data-bind="chaosTag" hidden>activa</span>
+            </span>
+            <div class="chaos-target" role="radiogroup" aria-labelledby="chaos-label">
+              <button type="button" role="radio" aria-checked="false" data-chaos-track="stable">
+                estable
+              </button>
+              <button type="button" role="radio" aria-checked="true" data-chaos-track="canary">
+                canary
+              </button>
+            </div>
+
+            <label class="control-label" for="failRate">
+              Errores 5xx
+              <output class="mono" data-bind="failOut" for="failRate">0%</output>
+            </label>
+            <input id="failRate" type="range" min="0" max="100" step="5" value="0" />
+
+            <label class="control-label" for="latency">
+              Latencia extra
+              <output class="mono" data-bind="latencyOut" for="latency">0 ms</output>
+            </label>
+            <input id="latency" type="range" min="0" max="3000" step="100" value="0" />
+
+            <label class="switch">
+              <input id="unhealthy" type="checkbox" />
+              <span>Responder 503 en <code>/api/health</code></span>
+            </label>
+
+            <div class="control-actions">
+              <button type="button" class="btn btn-danger" data-action="break-canary">
+                Romper la canary
+              </button>
+              <button type="button" class="btn btn-ghost" data-action="clear-chaos">
+                Limpiar chaos
+              </button>
+            </div>
+            <p class="hint">
+              Con errores o 503 sostenidos las alarmas de CloudWatch pasan a ALARM y
+              <code>canary-deploy.sh</code> ejecuta el rollback automático.
+            </p>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <footer class="footer">
+      <span class="footer-tag">BUILD · DEPLOY · EVOLVE</span>
+      <span class="mono muted" data-bind="footerMeta">—</span>
+    </footer>
+
+    <div class="toast-stack" data-bind="toasts" aria-live="polite" aria-atomic="false"></div>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>

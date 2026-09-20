@@ -1,0 +1,22 @@
+{
+  "name": "ecs-canary-traffic-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Demo app for AWS ECS canary deployments with a live traffic split monitor.",
+  "license": "MIT",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "smoke": "node scripts/smoke.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "3.1136.0",
+    "@aws-sdk/client-elastic-load-balancing-v2": "3.1136.0",
+    "@aws-sdk/lib-dynamodb": "3.1136.0",
+    "express": "5.2.1"
+  }
+}

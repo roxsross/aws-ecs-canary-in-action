@@ -1,0 +1,245 @@
+# ---------------------------------------------------------------------------
+# Static checks, container build and a real canary integration test.
+#
+# Nothing here touches AWS, so it runs on forks and pull requests with no
+# credentials. The integration job brings up the local stack (mini-alb + two app
+# versions + dynamodb-local), shifts the weights and asserts the split actually
+# moved, which is the behaviour the whole repo is about.
+#
+# Actions are pinned to major tags for readability. For a production repo, pin to
+# full commit SHAs instead.
+# ---------------------------------------------------------------------------
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Read only by default: nothing in this workflow needs to write.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint and validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            app/package-lock.json
+            infra/cdk/package-lock.json
+
+      - name: Check JavaScript syntax
+        run: |
+          fail=0
+          while IFS= read -r file; do
+            node --check "$file" || fail=1
+          done < <(find app local -name '*.js' -not -path '*/node_modules/*' | sort)
+          exit $fail
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: Shellcheck every script
+        run: |
+          fail=0
+          while IFS= read -r file; do
+            bash -n "$file" || fail=1
+            shellcheck -x "$file" || fail=1
+          done < <(find scripts infra -name '*.sh' -type f -not -path '*/node_modules/*' | sort)
+          exit $fail
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.11.2
+          terraform_wrapper: false
+
+      - name: Terraform fmt and validate
+        working-directory: infra/terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - name: Install cfn-lint
+        run: pipx install cfn-lint
+
+      # cfn-lint checks the template offline; `aws cloudformation validate-template`
+      # would need credentials, which pull requests deliberately do not have.
+      - name: Lint the CloudFormation template
+        run: cfn-lint infra/cloudformation/canary-stack.yaml
+
+      - name: CDK type check and synth
+        working-directory: infra/cdk
+        run: |
+          npm ci
+          npx tsc --noEmit
+          npx cdk synth \
+            -c vpcId=vpc-0123456789abcdef0 \
+            -c publicSubnetIds=subnet-0aaaaaaaaaaaaaaaa,subnet-0bbbbbbbbbbbbbbbb \
+            > /dev/null
+          echo "cdk synth ok"
+
+  container:
+    name: Container smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build the app image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./app
+          push: false
+          load: true
+          tags: canary-app:ci
+          build-args: |
+            APP_VERSION=ci-${{ github.run_number }}
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run the container
+        run: |
+          docker run -d --name canary-ci \
+            -p 8080:8080 \
+            -e TRACK=stable \
+            -e APP_VERSION=ci-${{ github.run_number }} \
+            canary-app:ci
+          echo "waiting for the container to report healthy"
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/api/health >/dev/null 2>&1; then
+              echo "healthy after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "the container never became healthy" >&2
+          docker logs canary-ci
+          exit 1
+
+      - name: Smoke test the endpoints
+        run: |
+          cd app
+          TRACK=stable BASE_URL=http://localhost:8080 node scripts/smoke.js
+
+      - name: Container logs
+        if: always()
+        run: docker logs canary-ci || true
+
+      - name: Stop the container
+        if: always()
+        run: docker rm -f canary-ci || true
+
+  integration:
+    name: Canary flow (local, no AWS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Start the local stack
+        working-directory: local
+        run: |
+          docker compose up --build -d
+          echo "waiting for the mini-alb to see healthy targets"
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8080/_alb/health >/dev/null 2>&1; then
+              echo "load balancer ready after ${i}s"
+              break
+            fi
+            sleep 2
+          done
+          curl -s http://localhost:8080/_alb/status | jq .
+
+      - name: Both versions answer when addressed directly
+        run: |
+          stable_track=$(curl -sf -D - -o /dev/null 'http://localhost:8080/api/hit?track=stable' \
+            | awk 'BEGIN{IGNORECASE=1} /^x-track:/ { gsub(/\r/,""); print $2 }')
+          canary_track=$(curl -sf -D - -o /dev/null 'http://localhost:8080/api/hit?track=canary' \
+            | awk 'BEGIN{IGNORECASE=1} /^x-track:/ { gsub(/\r/,""); print $2 }')
+          echo "forced stable -> ${stable_track}"
+          echo "forced canary -> ${canary_track}"
+          test "$stable_track" = "stable"
+          test "$canary_track" = "canary"
+
+      - name: All traffic goes to stable at 100/0
+        run: |
+          ./scripts/weights.sh --target local --stable 100 --canary 0
+          summary=$(./scripts/traffic-gen.sh --url http://localhost:8080 \
+            --requests 60 --concurrency 6 --json)
+          echo "$summary" | jq .
+          canary=$(echo "$summary" | jq -r '.canary')
+          errors=$(echo "$summary" | jq -r '.errors')
+          test "$canary" -eq 0 || { echo "expected no canary traffic, saw ${canary}" >&2; exit 1; }
+          test "$errors" -eq 0 || { echo "expected no errors, saw ${errors}" >&2; exit 1; }
+
+      - name: Traffic follows the weights at 50/50
+        run: |
+          ./scripts/weights.sh --target local --canary 50
+          summary=$(./scripts/traffic-gen.sh --url http://localhost:8080 \
+            --requests 200 --concurrency 8 --json)
+          echo "$summary" | jq .
+          observed=$(echo "$summary" | jq -r '.observedCanaryPercent | floor')
+          echo "observed canary share: ${observed}%"
+          # Weighted routing is random, so allow a generous band around 50%.
+          test "$observed" -ge 30 || { echo "canary share ${observed}% is too low" >&2; exit 1; }
+          test "$observed" -le 70 || { echo "canary share ${observed}% is too high" >&2; exit 1; }
+
+      - name: Injected faults show up as 5xx on the canary only
+        run: |
+          ./scripts/chaos.sh --url http://localhost:8080 --track canary --fail-rate 100
+          canary_status=$(curl -s -o /dev/null -w '%{http_code}' 'http://localhost:8080/api/hit?track=canary')
+          stable_status=$(curl -s -o /dev/null -w '%{http_code}' 'http://localhost:8080/api/hit?track=stable')
+          echo "canary=${canary_status} stable=${stable_status}"
+          test "$canary_status" = "500" || { echo "the canary should be failing" >&2; exit 1; }
+          test "$stable_status" = "200" || { echo "the stable track should be unaffected" >&2; exit 1; }
+
+      - name: An unhealthy canary is removed from rotation
+        run: |
+          ./scripts/chaos.sh --url http://localhost:8080 --track canary --fail-rate 0 --unhealthy
+          echo "waiting for the health checks to notice"
+          sleep 12
+          curl -s http://localhost:8080/_alb/status | jq '.targets'
+          healthy=$(curl -s http://localhost:8080/_alb/status \
+            | jq -r '.targets[] | select(.name == "canary") | .healthy')
+          test "$healthy" = "false" || { echo "the canary target should be unhealthy" >&2; exit 1; }
+
+          # This is the point of the whole exercise: even with 50% weight on a broken
+          # canary, users keep getting served by the healthy stable track.
+          summary=$(./scripts/traffic-gen.sh --url http://localhost:8080 \
+            --requests 40 --concurrency 4 --json)
+          echo "$summary" | jq .
+          stable=$(echo "$summary" | jq -r '.stable')
+          test "$stable" -eq 40 || { echo "expected all 40 requests on stable, got ${stable}" >&2; exit 1; }
+
+      - name: Clearing the faults brings the canary back
+        run: |
+          ./scripts/chaos.sh --url http://localhost:8080 --clear
+          sleep 12
+          healthy=$(curl -s http://localhost:8080/_alb/status \
+            | jq -r '.targets[] | select(.name == "canary") | .healthy')
+          test "$healthy" = "true" || { echo "the canary should have recovered" >&2; exit 1; }
+          ./scripts/weights.sh --target local --stable 100 --canary 0
+
+      - name: Stack logs
+        if: failure()
+        working-directory: local
+        run: docker compose logs --tail 200
+
+      - name: Tear down
+        if: always()
+        working-directory: local
+        run: docker compose down -v

@@ -1,0 +1,57 @@
+# -----------------------------------------------------------------------------
+# Copy to terraform.tfvars.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# Networking has two modes, controlled by a single switch: vpc_id.
+#
+#   Leave vpc_id empty (or delete the two lines below)   -> Terraform creates a
+#     small VPC just for this lab: public subnets, an internet gateway, done.
+#     Nothing else to configure. This is the default.
+#
+#   Set vpc_id to a VPC you already have                 -> nothing network
+#     related gets created; the lab plugs into your subnets instead.
+# -----------------------------------------------------------------------------
+
+aws_region   = "us-east-1"
+project_name = "canary-lab"
+
+# ---- network: use your own existing VPC instead of creating one ----
+# Uncomment and fill in to reuse a VPC you already have. Find the ids with:
+#   aws ec2 describe-vpcs --query 'Vpcs[].{Id:VpcId,Cidr:CidrBlock,Name:Tags[?Key==`Name`]|[0].Value}'
+#   aws ec2 describe-subnets --filters Name=vpc-id,Values=<your-vpc-id> \
+#     --query 'Subnets[].{Id:SubnetId,Az:AvailabilityZone,Public:MapPublicIpOnLaunch}'
+#
+# vpc_id            = "vpc-0123456789abcdef0"
+# public_subnet_ids = ["subnet-0aaa...", "subnet-0bbb..."]   # at least 2, different AZs
+
+# Tasks land in the ALB subnets unless you say otherwise. Private subnets need a
+# NAT gateway or VPC endpoints for ECR, CloudWatch Logs and DynamoDB. Only
+# relevant when vpc_id above is set; the created VPC always uses public subnets.
+# service_subnet_ids = ["subnet-0ccc...", "subnet-0ddd..."]
+# assign_public_ip   = false
+
+# The dashboard has no authentication. Narrow this to your own address unless you
+# actually want it open to the internet.
+# allowed_ingress_cidrs = ["203.0.113.4/32"]
+
+# ---- image ----
+image_tag = "v1"
+# create_ecr_repository = true    # let Terraform own the registry instead of build-push.sh
+# cpu_architecture     = "ARM64"  # only if you push arm64 images on purpose
+
+# ---- sizing ----
+stable_desired_count = 2
+canary_desired_count = 0 # canary-deploy.sh scales this up during a rollout
+
+# ---- rollback sensitivity (tuned for a live demo) ----
+alarm_period                    = 60
+alarm_evaluation_periods        = 1
+alarm_5xx_threshold             = 3
+alarm_latency_threshold_seconds = 1
+alarm_error_rate_threshold      = 5
+
+# ---- optional ----
+# admin_token          = "change-me"   # requires X-Admin-Token on /api/chaos and /api/reset
+# alarm_sns_topic_arns = ["arn:aws:sns:us-east-1:111122223333:canary-alerts"]
+# tags = { Owner = "roxsross", Environment = "lab" }

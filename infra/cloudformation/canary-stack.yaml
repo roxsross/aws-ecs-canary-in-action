@@ -1,0 +1,1064 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  ECS Canary in Action - weighted canary deployments on ECS Fargate behind an ALB,
+  deployed into an existing VPC. Creates no networking: the VPC and subnets are
+  referenced, never managed.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Existing network (referenced, not created)" }
+        Parameters: [VpcId, PublicSubnetIds, ServiceSubnetIds, AssignPublicIp, AllowedIngressCidr]
+      - Label: { default: "Container image" }
+        Parameters: [EcrRepositoryName, CreateEcrRepository, ImageTag, ContainerImage, ContainerPort, CpuArchitecture]
+      - Label: { default: "Service sizing" }
+        Parameters: [TaskCpu, TaskMemory, StableDesiredCount, CanaryDesiredCount, StableAppVersion, CanaryAppVersion, EnableExecuteCommand]
+      - Label: { default: "Traffic split" }
+        Parameters: [StableWeight, CanaryWeight]
+      - Label: { default: "Load balancer health checks" }
+        Parameters: [HealthCheckPath, HealthCheckInterval, HealthyThreshold, UnhealthyThreshold, DeregistrationDelay]
+      - Label: { default: "Rollback triggers" }
+        Parameters: [AlarmPeriod, AlarmEvaluationPeriods, Alarm5xxThreshold, AlarmLatencyThresholdSeconds, AlarmErrorRateThreshold, EnableEmfAlarm, AlarmSnsTopicArn]
+      - Label: { default: "App configuration" }
+        Parameters: [ProjectName, RecordMode, MetricsNamespace, AdminToken, GrantListenerRead, LogRetentionDays, EnableDashboard]
+    ParameterLabels:
+      VpcId: { default: "VPC id" }
+      PublicSubnetIds: { default: "Subnets for the ALB (at least two AZs)" }
+      ServiceSubnetIds: { default: "Subnets for the tasks (blank = same as the ALB)" }
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: canary-lab
+    AllowedPattern: "^[a-z][a-z0-9-]{2,23}$"
+    ConstraintDescription: 3-24 lowercase letters, digits or hyphens, starting with a letter.
+    Description: Prefix for every resource name. Short, because ALB names are capped at 32 characters.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC that will host the load balancer and tasks.
+
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets for the internet facing ALB. Pick at least two in different availability zones.
+
+  ServiceSubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >-
+      Subnets for the Fargate tasks. Leave blank to reuse the ALB subnets. Private
+      subnets need a NAT gateway or VPC endpoints for ECR, CloudWatch Logs and DynamoDB.
+
+  AssignPublicIp:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: ENABLED lets tasks in public subnets pull images without a NAT gateway.
+
+  AllowedIngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$"
+    Description: >-
+      CIDR allowed to reach the ALB on port 80. The dashboard has no authentication,
+      so narrow this to your own address for anything less disposable.
+
+  EcrRepositoryName:
+    Type: String
+    Default: ""
+    Description: ECR repository holding the app image. Blank means <ProjectName>-app.
+
+  CreateEcrRepository:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Let this stack own the ECR repository. Keep false when scripts/build-push.sh
+      creates it, which is the default flow (an image has to exist before a service runs it).
+
+  ImageTag:
+    Type: String
+    Default: v1
+    Description: Tag deployed on the first create.
+
+  ContainerImage:
+    Type: String
+    Default: ""
+    Description: Full image reference. Overrides the composed ECR URI when set.
+
+  ContainerPort:
+    Type: Number
+    Default: 8080
+    MinValue: 1
+    MaxValue: 65535
+
+  CpuArchitecture:
+    Type: String
+    Default: X86_64
+    AllowedValues: [X86_64, ARM64]
+    Description: Must match how the image was built. scripts/build-push.sh builds linux/amd64 by default.
+
+  TaskCpu:
+    Type: String
+    Default: "256"
+    AllowedValues: ["256", "512", "1024", "2048", "4096"]
+
+  TaskMemory:
+    Type: String
+    Default: "512"
+    Description: Must be a valid pairing for the chosen CPU.
+
+  StableDesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 0
+
+  CanaryDesiredCount:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: Starts at zero. scripts/canary-deploy.sh scales it up when a rollout begins.
+
+  StableAppVersion:
+    Type: String
+    Default: "1.0.0"
+
+  CanaryAppVersion:
+    Type: String
+    Default: "2.0.0"
+
+  EnableExecuteCommand:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: ECS Exec, for shelling into a task while debugging.
+
+  StableWeight:
+    Type: Number
+    Default: 100
+    MinValue: 0
+    MaxValue: 999
+    Description: >-
+      Listener weight for the stable target group. CloudFormation has no equivalent of
+      "ignore changes", so a stack update rewrites the live split: pass the current
+      weights (deploy.sh --keep-weights does it for you) to update mid rollout.
+
+  CanaryWeight:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 999
+    Description: Listener weight for the canary target group.
+
+  HealthCheckPath:
+    Type: String
+    Default: /api/health
+
+  HealthCheckInterval:
+    Type: Number
+    Default: 15
+    MinValue: 5
+    MaxValue: 300
+
+  HealthyThreshold:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 10
+
+  UnhealthyThreshold:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 10
+
+  DeregistrationDelay:
+    Type: Number
+    Default: 10
+    MinValue: 0
+    MaxValue: 3600
+    Description: Low on purpose, so rollbacks feel instant.
+
+  AlarmPeriod:
+    Type: Number
+    Default: 60
+    AllowedValues: [30, 60, 300]
+
+  AlarmEvaluationPeriods:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: 1 keeps a live demo snappy. Use 2-3 in production.
+
+  Alarm5xxThreshold:
+    Type: Number
+    Default: 3
+    MinValue: 1
+
+  AlarmLatencyThresholdSeconds:
+    Type: Number
+    Default: 1
+    MinValue: 0
+
+  AlarmErrorRateThreshold:
+    Type: Number
+    Default: 5
+    MinValue: 0
+    MaxValue: 100
+
+  EnableEmfAlarm:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Error rate alarm built from the embedded metrics the app emits.
+
+  EnableDashboard:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+  AlarmSnsTopicArn:
+    Type: String
+    Default: ""
+    Description: Optional SNS topic notified on ALARM and OK.
+
+  MetricsNamespace:
+    Type: String
+    Default: CanaryLab
+
+  RecordMode:
+    Type: String
+    Default: full
+    AllowedValues: [full, agg, off]
+    Description: How much traffic detail is written to DynamoDB.
+
+  AdminToken:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: >-
+      When set, /api/chaos and /api/reset require the X-Admin-Token header. Passed as a
+      plain task definition environment variable, which is fine for a lab; a real secret
+      belongs in Secrets Manager.
+
+  GrantListenerRead:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Lets the dashboard read and display the real configured weights.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+
+Conditions:
+  ShouldCreateEcr: !Equals [!Ref CreateEcrRepository, "true"]
+  HasServiceSubnets: !Not [!Equals [!Join ["", !Ref ServiceSubnetIds], ""]]
+  HasCustomImage: !Not [!Equals [!Ref ContainerImage, ""]]
+  HasCustomRepoName: !Not [!Equals [!Ref EcrRepositoryName, ""]]
+  EmfAlarmEnabled: !Equals [!Ref EnableEmfAlarm, "true"]
+  DashboardEnabled: !Equals [!Ref EnableDashboard, "true"]
+  HasSnsTopic: !Not [!Equals [!Ref AlarmSnsTopicArn, ""]]
+  ListenerReadEnabled: !Equals [!Ref GrantListenerRead, "true"]
+  ExecuteCommandEnabled: !Equals [!Ref EnableExecuteCommand, "true"]
+
+Resources:
+  # ---------------------------------------------------------------- registry
+  # Optional: an image must exist before a service can run it, so the default flow
+  # creates this from scripts/build-push.sh instead.
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Condition: ShouldCreateEcr
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !If [HasCustomRepoName, !Ref EcrRepositoryName, !Sub "${ProjectName}-app"]
+      ImageTagMutability: MUTABLE
+      EmptyOnDelete: true # lab convenience: lets the stack delete with images present
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep the 20 most recent images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 20
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # ------------------------------------------------------------------ storage
+  # Single table shared by every task of both tracks, which is what makes the
+  # dashboard a global view instead of one container's private counters.
+  #   pk=AGG   sk=<track>#<version> | pk=TS  sk=<minute>#<track>
+  #   pk=HIT   sk=<epochMs>#<rand>  | pk=CHAOS sk=<track>
+  TrafficTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${ProjectName}-traffic"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+  # ------------------------------------------------------------ security groups
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Ingress for the canary lab load balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedIngressCidr
+          Description: !Sub "HTTP from ${AllowedIngressCidr}"
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-alb" }
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Canary lab Fargate tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: App port, load balancer only
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Outbound to AWS APIs and the image registry
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-tasks" }
+
+  AlbEgressToTasks:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ContainerPort
+      ToPort: !Ref ContainerPort
+      DestinationSecurityGroupId: !Ref TaskSecurityGroup
+      Description: Forward to the app tasks
+
+  # ------------------------------------------------------------ load balancer
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-alb"
+      Type: application
+      Scheme: internet-facing
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      LoadBalancerAttributes:
+        - { Key: idle_timeout.timeout_seconds, Value: "60" }
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: "true" }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+  StableTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-stable"
+      VpcId: !Ref VpcId
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip # awsvpc networking registers task ENIs by IP
+      HealthCheckEnabled: true
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: !Ref HealthCheckInterval
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: !Ref HealthyThreshold
+      UnhealthyThresholdCount: !Ref UnhealthyThreshold
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: !Ref DeregistrationDelay }
+      Tags:
+        - { Key: Track, Value: stable }
+
+  CanaryTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-canary"
+      VpcId: !Ref VpcId
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: !Ref HealthCheckInterval
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: !Ref HealthyThreshold
+      UnhealthyThresholdCount: !Ref UnhealthyThreshold
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: !Ref DeregistrationDelay }
+      Tags:
+        - { Key: Track, Value: canary }
+
+  # The weighted default rule is the canary control knob.
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref StableTargetGroup
+                Weight: !Ref StableWeight
+              - TargetGroupArn: !Ref CanaryTargetGroup
+                Weight: !Ref CanaryWeight
+            TargetGroupStickinessConfig:
+              Enabled: false
+
+  # Forced routing: inspect one version without touching the weights.
+  ForceCanaryByQuery:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 10
+      Conditions:
+        - Field: query-string
+          QueryStringConfig:
+            Values:
+              - { Key: track, Value: canary }
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref CanaryTargetGroup
+
+  ForceStableByQuery:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 11
+      Conditions:
+        - Field: query-string
+          QueryStringConfig:
+            Values:
+              - { Key: track, Value: stable }
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref StableTargetGroup
+
+  ForceCanaryByHeader:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 20
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Canary
+            Values: [always]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref CanaryTargetGroup
+
+  ForceStableByHeader:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 21
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Canary
+            Values: [never]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref StableTargetGroup
+
+  # ---------------------------------------------------------------------- IAM
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-execution"
+      Description: Pulls images and ships container logs for the canary lab
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-task"
+      Description: Application permissions for the canary lab tasks
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: traffic-table
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:BatchWriteItem
+                Resource: !GetAtt TrafficTable.Arn
+
+  # elasticloadbalancing Describe* actions have no resource level permissions,
+  # so the resource must be "*".
+  ListenerReadPolicy:
+    Type: AWS::IAM::RolePolicy
+    Condition: ListenerReadEnabled
+    Properties:
+      RoleName: !Ref TaskRole
+      PolicyName: read-listener-weights
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:DescribeRules
+              - elasticloadbalancing:DescribeListeners
+            Resource: "*"
+
+  ExecCommandPolicy:
+    Type: AWS::IAM::RolePolicy
+    Condition: ExecuteCommandEnabled
+    Properties:
+      RoleName: !Ref TaskRole
+      PolicyName: ecs-exec
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - ssmmessages:CreateControlChannel
+              - ssmmessages:CreateDataChannel
+              - ssmmessages:OpenControlChannel
+              - ssmmessages:OpenDataChannel
+            Resource: "*"
+
+  # ---------------------------------------------------------------------- ECS
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ProjectName
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+          Base: 0
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled # keeps the lab cheap
+
+  StableTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-stable"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: !Ref CpuArchitecture
+      ContainerDefinitions:
+        - Name: app
+          Essential: true
+          Image: !If
+            - HasCustomImage
+            - !Ref ContainerImage
+            - !Sub
+              - "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Repo}:${ImageTag}"
+              - Repo: !If [HasCustomRepoName, !Ref EcrRepositoryName, !Sub "${ProjectName}-app"]
+          PortMappings:
+            - Name: http
+              ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+              AppProtocol: http
+          StopTimeout: 20
+          # Deliberately no container HealthCheck: the target group health check is
+          # what drives the alarms and the rollback decision.
+          Environment:
+            - { Name: TRACK, Value: stable }
+            - { Name: APP_VERSION, Value: !Ref StableAppVersion }
+            - { Name: PROJECT_NAME, Value: !Ref ProjectName }
+            - { Name: PORT, Value: !Ref ContainerPort }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: TABLE_NAME, Value: !Ref TrafficTable }
+            - { Name: RECORD_MODE, Value: !Ref RecordMode }
+            - { Name: METRICS_NAMESPACE, Value: !Ref MetricsNamespace }
+            - { Name: LISTENER_ARN, Value: !Ref Listener }
+            - { Name: STABLE_TARGET_GROUP_ARN, Value: !Ref StableTargetGroup }
+            - { Name: CANARY_TARGET_GROUP_ARN, Value: !Ref CanaryTargetGroup }
+            - { Name: ADMIN_TOKEN, Value: !Ref AdminToken }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: stable
+
+  CanaryTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-canary"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: !Ref CpuArchitecture
+      ContainerDefinitions:
+        - Name: app
+          Essential: true
+          Image: !If
+            - HasCustomImage
+            - !Ref ContainerImage
+            - !Sub
+              - "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Repo}:${ImageTag}"
+              - Repo: !If [HasCustomRepoName, !Ref EcrRepositoryName, !Sub "${ProjectName}-app"]
+          PortMappings:
+            - Name: http
+              ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+              AppProtocol: http
+          StopTimeout: 20
+          Environment:
+            - { Name: TRACK, Value: canary }
+            - { Name: APP_VERSION, Value: !Ref CanaryAppVersion }
+            - { Name: PROJECT_NAME, Value: !Ref ProjectName }
+            - { Name: PORT, Value: !Ref ContainerPort }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: TABLE_NAME, Value: !Ref TrafficTable }
+            - { Name: RECORD_MODE, Value: !Ref RecordMode }
+            - { Name: METRICS_NAMESPACE, Value: !Ref MetricsNamespace }
+            - { Name: LISTENER_ARN, Value: !Ref Listener }
+            - { Name: STABLE_TARGET_GROUP_ARN, Value: !Ref StableTargetGroup }
+            - { Name: CANARY_TARGET_GROUP_ARN, Value: !Ref CanaryTargetGroup }
+            - { Name: ADMIN_TOKEN, Value: !Ref AdminToken }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: canary
+
+  StableService:
+    Type: AWS::ECS::Service
+    DependsOn: [Listener, ForceStableByQuery]
+    Properties:
+      ServiceName: !Sub "${ProjectName}-stable"
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref StableTaskDefinition
+      DesiredCount: !Ref StableDesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      EnableExecuteCommand: !Ref EnableExecuteCommand
+      PropagateTags: SERVICE
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !If [HasServiceSubnets, !Ref ServiceSubnetIds, !Ref PublicSubnetIds]
+          SecurityGroups: [!Ref TaskSecurityGroup]
+          AssignPublicIp: !Ref AssignPublicIp
+      LoadBalancers:
+        - TargetGroupArn: !Ref StableTargetGroup
+          ContainerName: app
+          ContainerPort: !Ref ContainerPort
+      Tags:
+        - { Key: Track, Value: stable }
+
+  CanaryService:
+    Type: AWS::ECS::Service
+    DependsOn: [Listener, ForceCanaryByQuery]
+    Properties:
+      ServiceName: !Sub "${ProjectName}-canary"
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref CanaryTaskDefinition
+      DesiredCount: !Ref CanaryDesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      EnableExecuteCommand: !Ref EnableExecuteCommand
+      PropagateTags: SERVICE
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !If [HasServiceSubnets, !Ref ServiceSubnetIds, !Ref PublicSubnetIds]
+          SecurityGroups: [!Ref TaskSecurityGroup]
+          AssignPublicIp: !Ref AssignPublicIp
+      LoadBalancers:
+        - TargetGroupArn: !Ref CanaryTargetGroup
+          ContainerName: app
+          ContainerPort: !Ref ContainerPort
+      Tags:
+        - { Key: Track, Value: canary }
+
+  # ------------------------------------------------------------------- alarms
+  # Scoped to the canary target group. canary-deploy.sh polls these between
+  # traffic steps: any ALARM aborts the rollout and shifts traffic back.
+  Canary5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-canary-5xx"
+      AlarmDescription: Canary target group is returning 5xx responses
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Statistic: Sum
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt CanaryTargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt LoadBalancer.LoadBalancerFullName
+      Period: !Ref AlarmPeriod
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref Alarm5xxThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching # no canary traffic yet is not a failure
+      AlarmActions: !If [HasSnsTopic, [!Ref AlarmSnsTopicArn], !Ref AWS::NoValue]
+      OKActions: !If [HasSnsTopic, [!Ref AlarmSnsTopicArn], !Ref AWS::NoValue]
+
+  CanaryLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-canary-latency"
+      AlarmDescription: Canary p95 latency is above the agreed budget
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      ExtendedStatistic: p95
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt CanaryTargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt LoadBalancer.LoadBalancerFullName
+      Period: !Ref AlarmPeriod
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref AlarmLatencyThresholdSeconds
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasSnsTopic, [!Ref AlarmSnsTopicArn], !Ref AWS::NoValue]
+      OKActions: !If [HasSnsTopic, [!Ref AlarmSnsTopicArn], !Ref AWS::NoValue]
+
+  CanaryUnhealthyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-canary-unhealthy"
+      AlarmDescription: Canary target group has unhealthy targets
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Statistic: Maximum
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt CanaryTargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt LoadBalancer.LoadBalancerFullName
+      Period: !Ref AlarmPeriod
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasSnsTopic, [!Ref AlarmSnsTopicArn], !Ref AWS::NoValue]
+      OKActions: !If [HasSnsTopic, [!Ref AlarmSnsTopicArn], !Ref AWS::NoValue]
+
+  # Error rate from the app's embedded metrics: catches application failures that
+  # never reach the ALB as 5xx, and proves the EMF pipeline works.
+  CanaryErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EmfAlarmEnabled
+    Properties:
+      AlarmName: !Sub "${ProjectName}-canary-error-rate"
+      AlarmDescription: !Sub "Canary application error rate above ${AlarmErrorRateThreshold}%"
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref AlarmErrorRateThreshold
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: error_rate
+          Label: Canary error rate (%)
+          Expression: "IF(requests > 0, 100 * errors / requests, 0)"
+          ReturnData: true
+        - Id: errors
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Ref MetricsNamespace
+              MetricName: ErrorCount
+              Dimensions:
+                - { Name: Track, Value: canary }
+            Period: !Ref AlarmPeriod
+            Stat: Sum
+        - Id: requests
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Ref MetricsNamespace
+              MetricName: RequestCount
+              Dimensions:
+                - { Name: Track, Value: canary }
+            Period: !Ref AlarmPeriod
+            Stat: Sum
+      AlarmActions: !If [HasSnsTopic, [!Ref AlarmSnsTopicArn], !Ref AWS::NoValue]
+      OKActions: !If [HasSnsTopic, [!Ref AlarmSnsTopicArn], !Ref AWS::NoValue]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: DashboardEnabled
+    Properties:
+      DashboardName: !Sub "${ProjectName}-canary"
+      DashboardBody: !Sub
+        - |
+          {
+            "widgets": [
+              {
+                "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+                "properties": {
+                  "title": "Requests per target group",
+                  "region": "${AWS::Region}", "view": "timeSeries", "period": 60, "stat": "Sum",
+                  "metrics": [
+                    [ "AWS/ApplicationELB", "RequestCount", "TargetGroup", "${StableTg}", "LoadBalancer", "${Alb}", { "label": "stable" } ],
+                    [ "...", "${CanaryTg}", ".", "${Alb}", { "label": "canary" } ]
+                  ]
+                }
+              },
+              {
+                "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+                "properties": {
+                  "title": "5xx per target group",
+                  "region": "${AWS::Region}", "view": "timeSeries", "period": 60, "stat": "Sum",
+                  "metrics": [
+                    [ "AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "TargetGroup", "${StableTg}", "LoadBalancer", "${Alb}", { "label": "stable 5xx" } ],
+                    [ "...", "${CanaryTg}", ".", "${Alb}", { "label": "canary 5xx", "color": "#d62728" } ]
+                  ],
+                  "annotations": { "horizontal": [ { "label": "alarm threshold", "value": ${Alarm5xxThreshold}, "color": "#d62728" } ] }
+                }
+              },
+              {
+                "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+                "properties": {
+                  "title": "p95 latency per target group",
+                  "region": "${AWS::Region}", "view": "timeSeries", "period": 60, "stat": "p95",
+                  "metrics": [
+                    [ "AWS/ApplicationELB", "TargetResponseTime", "TargetGroup", "${StableTg}", "LoadBalancer", "${Alb}", { "label": "stable p95" } ],
+                    [ "...", "${CanaryTg}", ".", "${Alb}", { "label": "canary p95", "color": "#d62728" } ]
+                  ],
+                  "annotations": { "horizontal": [ { "label": "latency budget", "value": ${AlarmLatencyThresholdSeconds}, "color": "#d62728" } ] }
+                }
+              },
+              {
+                "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+                "properties": {
+                  "title": "Healthy targets",
+                  "region": "${AWS::Region}", "view": "timeSeries", "period": 60, "stat": "Average",
+                  "metrics": [
+                    [ "AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${StableTg}", "LoadBalancer", "${Alb}", { "label": "stable healthy" } ],
+                    [ "...", "${CanaryTg}", ".", "${Alb}", { "label": "canary healthy" } ],
+                    [ "AWS/ApplicationELB", "UnHealthyHostCount", "TargetGroup", "${CanaryTg}", "LoadBalancer", "${Alb}", { "label": "canary unhealthy", "color": "#d62728" } ]
+                  ]
+                }
+              },
+              {
+                "type": "metric", "x": 0, "y": 12, "width": 12, "height": 6,
+                "properties": {
+                  "title": "Application metrics (EMF) by track",
+                  "region": "${AWS::Region}", "view": "timeSeries", "period": 60, "stat": "Sum",
+                  "metrics": [
+                    [ "${MetricsNamespace}", "RequestCount", "Track", "stable", { "label": "stable requests" } ],
+                    [ "...", "canary", { "label": "canary requests" } ],
+                    [ "${MetricsNamespace}", "ErrorCount", "Track", "canary", { "label": "canary errors", "color": "#d62728" } ]
+                  ]
+                }
+              },
+              {
+                "type": "alarm", "x": 12, "y": 12, "width": 12, "height": 6,
+                "properties": {
+                  "title": "Canary rollback triggers",
+                  "alarms": [ "${Alarm5xx}", "${AlarmLatency}", "${AlarmUnhealthy}" ]
+                }
+              }
+            ]
+          }
+        - StableTg: !GetAtt StableTargetGroup.TargetGroupFullName
+          CanaryTg: !GetAtt CanaryTargetGroup.TargetGroupFullName
+          Alb: !GetAtt LoadBalancer.LoadBalancerFullName
+          Alarm5xx: !GetAtt Canary5xxAlarm.Arn
+          AlarmLatency: !GetAtt CanaryLatencyAlarm.Arn
+          AlarmUnhealthy: !GetAtt CanaryUnhealthyAlarm.Arn
+
+Outputs:
+  AppUrl:
+    Description: Open this to get the live traffic dashboard.
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+
+  StableOnlyUrl:
+    Description: Forced routing to the stable version, ignoring the weights.
+    Value: !Sub "http://${LoadBalancer.DNSName}/?track=stable"
+
+  CanaryOnlyUrl:
+    Description: Forced routing to the canary version, ignoring the weights.
+    Value: !Sub "http://${LoadBalancer.DNSName}/?track=canary"
+
+  CloudWatchDashboardUrl:
+    Condition: DashboardEnabled
+    Description: CloudWatch dashboard comparing both tracks.
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/${ProjectName}-canary"
+
+  # ---- consumed by scripts/load-env.sh (keep these names in sync) ----
+  CanaryRegion:
+    Value: !Ref AWS::Region
+    Export: { Name: !Sub "${AWS::StackName}-CanaryRegion" }
+
+  CanaryProject:
+    Value: !Ref ProjectName
+    Export: { Name: !Sub "${AWS::StackName}-CanaryProject" }
+
+  CanaryCluster:
+    Value: !Ref Cluster
+    Export: { Name: !Sub "${AWS::StackName}-CanaryCluster" }
+
+  CanaryAlbDns:
+    Value: !GetAtt LoadBalancer.DNSName
+    Export: { Name: !Sub "${AWS::StackName}-CanaryAlbDns" }
+
+  CanaryAlbArn:
+    Value: !Ref LoadBalancer
+    Export: { Name: !Sub "${AWS::StackName}-CanaryAlbArn" }
+
+  CanaryListenerArn:
+    Value: !Ref Listener
+    Export: { Name: !Sub "${AWS::StackName}-CanaryListenerArn" }
+
+  CanaryTgStable:
+    Value: !Ref StableTargetGroup
+    Export: { Name: !Sub "${AWS::StackName}-CanaryTgStable" }
+
+  CanaryTgCanary:
+    Value: !Ref CanaryTargetGroup
+    Export: { Name: !Sub "${AWS::StackName}-CanaryTgCanary" }
+
+  CanarySvcStable:
+    Value: !GetAtt StableService.Name
+    Export: { Name: !Sub "${AWS::StackName}-CanarySvcStable" }
+
+  CanarySvcCanary:
+    Value: !GetAtt CanaryService.Name
+    Export: { Name: !Sub "${AWS::StackName}-CanarySvcCanary" }
+
+  CanaryTaskdefStable:
+    Value: !Sub "${ProjectName}-stable"
+    Export: { Name: !Sub "${AWS::StackName}-CanaryTaskdefStable" }
+
+  CanaryTaskdefCanary:
+    Value: !Sub "${ProjectName}-canary"
+    Export: { Name: !Sub "${AWS::StackName}-CanaryTaskdefCanary" }
+
+  CanaryEcrRepo:
+    Value: !If [HasCustomRepoName, !Ref EcrRepositoryName, !Sub "${ProjectName}-app"]
+    Export: { Name: !Sub "${AWS::StackName}-CanaryEcrRepo" }
+
+  CanaryEcrUri:
+    Value: !Sub
+      - "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Repo}"
+      - Repo: !If [HasCustomRepoName, !Ref EcrRepositoryName, !Sub "${ProjectName}-app"]
+    Export: { Name: !Sub "${AWS::StackName}-CanaryEcrUri" }
+
+  CanaryTable:
+    Value: !Ref TrafficTable
+    Export: { Name: !Sub "${AWS::StackName}-CanaryTable" }
+
+  CanaryLogGroup:
+    Value: !Ref LogGroup
+    Export: { Name: !Sub "${AWS::StackName}-CanaryLogGroup" }
+
+  CanaryAlarm5xx:
+    Value: !Ref Canary5xxAlarm
+    Export: { Name: !Sub "${AWS::StackName}-CanaryAlarm5xx" }
+
+  CanaryAlarmLatency:
+    Value: !Ref CanaryLatencyAlarm
+    Export: { Name: !Sub "${AWS::StackName}-CanaryAlarmLatency" }
+
+  CanaryAlarmUnhealthy:
+    Value: !Ref CanaryUnhealthyAlarm
+    Export: { Name: !Sub "${AWS::StackName}-CanaryAlarmUnhealthy" }
+
+  CanaryAlarmErrorrate:
+    Condition: EmfAlarmEnabled
+    Value: !Ref CanaryErrorRateAlarm
+    Export: { Name: !Sub "${AWS::StackName}-CanaryAlarmErrorrate" }
+
+  CanaryContainerName:
+    Value: app
+
+  CanaryContainerPort:
+    Value: !Ref ContainerPort

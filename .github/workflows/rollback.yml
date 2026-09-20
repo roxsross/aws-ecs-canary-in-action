@@ -1,0 +1,98 @@
+# ---------------------------------------------------------------------------
+# The break glass workflow: send every request back to the stable track.
+#
+# Traffic rollback is instant because it only rewrites the listener weights, so
+# this is safe to run at any time, including while a rollout is in progress.
+# ---------------------------------------------------------------------------
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      revert_task_definition:
+        description: "Also roll the stable service back one revision"
+        required: false
+        default: false
+        type: boolean
+      keep_canary:
+        description: "Leave the canary tasks running for a post mortem"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  # Deliberately the same group as the rollout, so a rollback queues behind (and
+  # then corrects) whatever a rollout was doing.
+  group: canary-rollout
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  PROJECT_NAME: ${{ vars.PROJECT_NAME || 'canary-lab' }}
+  IAC_FLAVOUR: ${{ vars.IAC_FLAVOUR || 'terraform' }}
+  STACK_NAME: ${{ vars.STACK_NAME || 'canary-lab' }}
+
+jobs:
+  rollback:
+    name: Traffic back to stable
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: canary-rollback-${{ github.run_id }}
+
+      - uses: hashicorp/setup-terraform@v4
+        if: env.IAC_FLAVOUR == 'terraform'
+        with:
+          terraform_version: 1.11.2
+          terraform_wrapper: false
+
+      - name: Load the deployment environment
+        run: |
+          if [ "${IAC_FLAVOUR}" = "terraform" ]; then
+            terraform -chdir=infra/terraform init -input=false
+          fi
+          ./scripts/load-env.sh "${IAC_FLAVOUR}" \
+            --stack "${STACK_NAME}" \
+            --region "${AWS_REGION}"
+
+      - name: State before
+        run: |
+          {
+            echo "### Before"
+            echo '```json'
+            ./scripts/status.sh --json | jq '{split, services, alarmsFiring}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Roll back
+        run: |
+          args="--yes"
+          if [ "${{ inputs.revert_task_definition }}" = "true" ]; then
+            args="$args --previous"
+          fi
+          if [ "${{ inputs.keep_canary }}" = "true" ]; then
+            args="$args --keep-canary"
+          fi
+          # shellcheck disable=SC2086
+          ./scripts/rollback.sh $args
+
+      - name: State after
+        if: always()
+        run: |
+          {
+            echo "### After"
+            echo '```json'
+            ./scripts/status.sh --json | jq '{split, services, targets}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

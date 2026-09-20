@@ -1,0 +1,223 @@
+# ---------------------------------------------------------------------------
+# Progressive canary rollout from CI.
+#
+# Setup, once:
+#   1. create the OIDC provider and role:  infra/github-oidc/oidc-role.yaml
+#   2. repository secret   AWS_ROLE_ARN    arn:aws:iam::<account>:role/<role>
+#   3. repository variables
+#        AWS_REGION    us-east-1
+#        PROJECT_NAME  canary-lab
+#        IAC_FLAVOUR   terraform | cloudformation | cdk
+#        STACK_NAME    canary-lab            (CloudFormation / CDK only)
+#   4. optional: a "production" environment with required reviewers, which turns
+#      the promote job into a manual approval gate
+#
+# No long lived access keys: the job assumes a role through OIDC.
+# ---------------------------------------------------------------------------
+name: Deploy canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to roll out (also used as APP_VERSION)"
+        required: true
+        type: string
+      steps:
+        description: "Canary percentages, comma separated"
+        required: false
+        default: "5,25,50,100"
+        type: string
+      bake:
+        description: "Seconds to watch the alarms at each step"
+        required: false
+        default: "90"
+        type: string
+      canary_tasks:
+        description: "How many canary tasks to run"
+        required: false
+        default: "1"
+        type: string
+      promote:
+        description: "How to finish the rollout"
+        required: false
+        default: auto
+        type: choice
+        options: [auto, manual]
+
+permissions:
+  contents: read
+
+concurrency:
+  # One rollout at a time: two overlapping runs would fight over the weights.
+  group: canary-rollout
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  PROJECT_NAME: ${{ vars.PROJECT_NAME || 'canary-lab' }}
+  IAC_FLAVOUR: ${{ vars.IAC_FLAVOUR || 'terraform' }}
+  STACK_NAME: ${{ vars.STACK_NAME || 'canary-lab' }}
+
+jobs:
+  build:
+    name: Build and push ${{ inputs.tag }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required for OIDC
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: canary-build-${{ github.run_id }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push
+        id: push
+        run: |
+          image=$(./scripts/build-push.sh \
+            --tag "${{ inputs.tag }}" \
+            --project "${PROJECT_NAME}" \
+            --region "${AWS_REGION}" \
+            | tail -1)
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "### Image" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${image}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  rollout:
+    name: Shift traffic
+    needs: build
+    runs-on: ubuntu-latest
+    # Point this at a GitHub environment with reviewers to gate the rollout itself.
+    environment: canary
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: canary-rollout-${{ github.run_id }}
+
+      - uses: hashicorp/setup-terraform@v4
+        if: env.IAC_FLAVOUR == 'terraform'
+        with:
+          terraform_version: 1.11.2
+          terraform_wrapper: false
+
+      - name: Load the deployment environment
+        run: |
+          if [ "${IAC_FLAVOUR}" = "terraform" ]; then
+            # Terraform needs its state to read the outputs. With a remote backend
+            # this just works; with local state, use the cloudformation or cdk
+            # flavour from CI instead, since the outputs live in the stack.
+            terraform -chdir=infra/terraform init -input=false
+          fi
+          ./scripts/load-env.sh "${IAC_FLAVOUR}" \
+            --stack "${STACK_NAME}" \
+            --region "${AWS_REGION}"
+
+      - name: State before the rollout
+        run: |
+          {
+            echo "### Before"
+            echo '```json'
+            ./scripts/status.sh --json | jq '{split, services, targets, alarmsFiring}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Canary rollout
+        run: |
+          extra=""
+          if [ "${{ inputs.promote }}" = "manual" ]; then
+            extra="--no-promote"
+          fi
+          ./scripts/canary-deploy.sh \
+            --image "${{ needs.build.outputs.image }}" \
+            --steps "${{ inputs.steps }}" \
+            --bake "${{ inputs.bake }}" \
+            --canary-tasks "${{ inputs.canary_tasks }}" \
+            --yes \
+            $extra
+
+      - name: State after the rollout
+        if: always()
+        run: |
+          {
+            echo "### After"
+            echo '```json'
+            ./scripts/status.sh --json | jq '{split, services, targets, alarmsFiring}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # canary-deploy.sh rolls back on its own when an alarm fires. This is the
+      # belt and braces for anything else that could kill the job, like a runner
+      # timeout partway through a traffic shift.
+      - name: Make sure traffic is back on stable
+        if: failure()
+        run: |
+          echo "the rollout failed, forcing traffic back to stable" >&2
+          ./scripts/rollback.sh --yes || true
+          {
+            echo "### Rolled back"
+            echo "The rollout failed and traffic was returned to the stable track."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  promote:
+    name: Promote to stable
+    needs: [build, rollout]
+    if: inputs.promote == 'manual'
+    runs-on: ubuntu-latest
+    # Add required reviewers to this environment for a real approval gate.
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: canary-promote-${{ github.run_id }}
+
+      - uses: hashicorp/setup-terraform@v4
+        if: env.IAC_FLAVOUR == 'terraform'
+        with:
+          terraform_version: 1.11.2
+          terraform_wrapper: false
+
+      - name: Load the deployment environment
+        run: |
+          if [ "${IAC_FLAVOUR}" = "terraform" ]; then
+            terraform -chdir=infra/terraform init -input=false
+          fi
+          ./scripts/load-env.sh "${IAC_FLAVOUR}" \
+            --stack "${STACK_NAME}" \
+            --region "${AWS_REGION}"
+
+      - name: Promote
+        run: ./scripts/promote.sh --image "${{ needs.build.outputs.image }}" --yes
+
+      - name: Final state
+        if: always()
+        run: |
+          {
+            echo "### Promoted"
+            echo '```json'
+            ./scripts/status.sh --json | jq '{split, services, targets}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

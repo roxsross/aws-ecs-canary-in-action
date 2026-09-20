@@ -1,0 +1,204 @@
+# ---------------------------------------------------------------------------
+# Terraform lifecycle for the canary lab.
+#
+#   pull request      fmt, validate and plan, with the plan in the run summary
+#   workflow_dispatch plan, or apply the exact plan that was just produced
+#
+# Needs a remote backend to be useful in CI: uncomment the S3 block in
+# infra/terraform/versions.tf, otherwise every run starts from empty state and
+# would try to create everything again.
+#
+# Repository variables that tell the plan which existing network to use:
+#   TF_VPC_ID             vpc-0123456789abcdef0
+#   TF_PUBLIC_SUBNET_IDS  subnet-0aaa,subnet-0bbb
+# ---------------------------------------------------------------------------
+name: Infrastructure (Terraform)
+
+on:
+  pull_request:
+    paths:
+      - "infra/terraform/**"
+      - ".github/workflows/infra-terraform.yml"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "What to run"
+        required: true
+        default: plan
+        type: choice
+        options: [plan, apply]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  PROJECT_NAME: ${{ vars.PROJECT_NAME || 'canary-lab' }}
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TERRAFORM_VERSION: 1.11.2
+
+jobs:
+  validate:
+    name: Format and validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.11.2
+          terraform_wrapper: false
+
+      # No credentials needed, so this also runs on forks.
+      - name: Check formatting and configuration
+        working-directory: infra/terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate
+
+  plan:
+    name: Plan
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      has_credentials: ${{ steps.creds.outputs.available }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Are credentials configured?
+        id: creds
+        run: |
+          if [ -n "${{ secrets.AWS_ROLE_ARN }}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "AWS_ROLE_ARN is not set, so there is nothing to plan against." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: hashicorp/setup-terraform@v4
+        if: steps.creds.outputs.available == 'true'
+        with:
+          terraform_version: 1.11.2
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        if: steps.creds.outputs.available == 'true'
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: terraform-plan-${{ github.run_id }}
+
+      - name: Plan
+        if: steps.creds.outputs.available == 'true'
+        working-directory: infra/terraform
+        env:
+          TF_VPC_ID: ${{ vars.TF_VPC_ID }}
+          TF_PUBLIC_SUBNET_IDS: ${{ vars.TF_PUBLIC_SUBNET_IDS }}
+        run: |
+          if [ -z "${TF_VPC_ID}" ] || [ -z "${TF_PUBLIC_SUBNET_IDS}" ]; then
+            echo "set the TF_VPC_ID and TF_PUBLIC_SUBNET_IDS repository variables" >&2
+            echo "find them with: ./scripts/discover-vpc.sh --format tfvars" >&2
+            exit 1
+          fi
+
+          # The variable is a comma separated string; Terraform wants a JSON list.
+          subnets_json=$(printf '%s' "${TF_PUBLIC_SUBNET_IDS}" \
+            | tr ',' '\n' | sed '/^[[:space:]]*$/d' | jq -R 'ltrimstr(" ") | rtrimstr(" ")' | jq -sc .)
+          echo "planning with subnets ${subnets_json}"
+
+          terraform init -input=false
+
+          set +e
+          terraform plan -no-color -input=false -out=tfplan \
+            -var "aws_region=${AWS_REGION}" \
+            -var "project_name=${PROJECT_NAME}" \
+            -var "vpc_id=${TF_VPC_ID}" \
+            -var "public_subnet_ids=${subnets_json}" \
+            > plan.txt 2>&1
+          status=$?
+          set -e
+
+          {
+            echo "### terraform plan"
+            echo '```terraform'
+            tail -c 60000 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit $status
+
+      - name: Upload the plan
+        if: steps.creds.outputs.available == 'true' && github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: |
+            infra/terraform/tfplan
+            infra/terraform/plan.txt
+          retention-days: 5
+          if-no-files-found: error
+
+  apply:
+    name: Apply
+    needs: plan
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.action == 'apply' &&
+      needs.plan.outputs.has_credentials == 'true'
+    runs-on: ubuntu-latest
+    # Add required reviewers to this environment to gate infrastructure changes.
+    environment: infra
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.11.2
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: terraform-apply-${{ github.run_id }}
+
+      - name: Download the reviewed plan
+        uses: actions/download-artifact@v8
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: infra/terraform
+
+      # Applying the saved plan, not a fresh one, so what was reviewed is what runs.
+      - name: Apply
+        working-directory: infra/terraform
+        run: |
+          terraform init -input=false
+          terraform apply -no-color -input=false -auto-approve tfplan
+
+      - name: Outputs
+        if: always()
+        working-directory: infra/terraform
+        run: |
+          {
+            echo "### Deployed"
+            echo '```'
+            terraform output -raw app_url || true
+            echo '```'
+            echo ""
+            echo "Load the script environment locally with:"
+            echo '```bash'
+            echo "./scripts/load-env.sh terraform"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,106 @@
+# ---------------------------------------------------------------------------
+# Rehearse the whole canary flow with no AWS account.
+#
+#   cd local && docker compose up --build -d
+#   open http://localhost:8080
+#
+#   ALB      http://localhost:8080   (mini-alb, weighted routing + health checks)
+#   stable   http://localhost:8081   (direct, bypasses the balancer)
+#   canary   http://localhost:8082   (direct)
+#   dynamodb http://localhost:8000   (dynamodb-local, in memory)
+#
+# Shift traffic exactly like the real thing:
+#   curl -XPOST localhost:8080/_alb/weights -d '{"stable":95,"canary":5}'
+#   ../scripts/weights.sh --target local --canary 25
+#
+# Run several canary tasks to see more than one task id in the dashboard:
+#   docker compose up -d --scale canary=3
+# ---------------------------------------------------------------------------
+name: canary-lab
+
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:3.3.1
+    container_name: canary-lab-dynamodb
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    ports:
+      - "8000:8000"
+    networks: [canary]
+
+  stable:
+    build:
+      context: ../app
+      args:
+        APP_VERSION: "1.0.0"
+    image: canary-lab-app:local
+    environment:
+      TRACK: stable
+      APP_VERSION: "1.0.0"
+      PROJECT_NAME: canary-lab-local
+      PORT: "8080"
+      TABLE_NAME: canary-lab-traffic
+      DYNAMO_ENDPOINT: http://dynamodb:8000
+      AWS_REGION: us-east-1
+      # dynamodb-local ignores the values but the SDK insists on finding credentials.
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+    ports:
+      - "8081:8080"
+    depends_on:
+      - dynamodb
+    networks: [canary]
+    restart: unless-stopped
+
+  canary:
+    build:
+      context: ../app
+      args:
+        APP_VERSION: "2.0.0"
+    image: canary-lab-app:local
+    environment:
+      TRACK: canary
+      APP_VERSION: "2.0.0"
+      PROJECT_NAME: canary-lab-local
+      PORT: "8080"
+      TABLE_NAME: canary-lab-traffic
+      DYNAMO_ENDPOINT: http://dynamodb:8000
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      # Ship a deliberately bad canary with:
+      #   FAIL_RATE: "25"
+      #   LATENCY_MS: "800"
+    ports:
+      - "8082:8080"
+    depends_on:
+      - dynamodb
+    networks: [canary]
+    restart: unless-stopped
+
+  alb:
+    image: node:22-alpine
+    container_name: canary-lab-alb
+    working_dir: /srv
+    command: ["node", "server.js"]
+    volumes:
+      - ./mini-alb:/srv:ro
+    environment:
+      PORT: "8080"
+      STABLE_URL: http://stable:8080
+      CANARY_URL: http://canary:8080
+      STABLE_WEIGHT: "100"
+      CANARY_WEIGHT: "0"
+      HEALTH_INTERVAL_MS: "5000"
+    ports:
+      - "8080:8080"
+    depends_on:
+      stable:
+        condition: service_healthy
+      canary:
+        condition: service_healthy
+    networks: [canary]
+    restart: unless-stopped
+
+networks:
+  canary:
+    name: canary-lab

@@ -1,0 +1,17 @@
+**/node_modules
+**/.git
+**/.github
+**/.terraform
+**/cdk.out
+**/*.tfstate*
+infra/
+docs/
+local/
+scripts/
+.canary.env*
+*.md
+!app/README.md
+.DS_Store
+**/npm-debug.log*
+**/coverage
+**/tmp

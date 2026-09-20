@@ -1,0 +1,59 @@
+# ---- node ----
+node_modules/
+npm-debug.log*
+.npm/
+*.tsbuildinfo
+
+# ---- terraform ----
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfplan.json
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+terraform.tfvars
+!terraform.tfvars.example
+
+# ---- cdk ----
+infra/cdk/cdk.out/
+infra/cdk/*.d.ts
+infra/cdk/*.js
+!infra/cdk/jest.config.js
+infra/cdk/dist/
+
+# ---- cloudformation ----
+infra/cloudformation/params.json
+infra/cloudformation/packaged-*.yaml
+
+# ---- generated env contract (created by scripts/load-env.sh) ----
+.canary.env
+.canary.env.*
+
+# ---- local / os / editor ----
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# ---- secrets ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials
+
+# ---- misc ----
+tmp/
+out/
+coverage/
+*.log

@@ -1,0 +1,16 @@
+[
+  { "ParameterKey": "ProjectName", "ParameterValue": "canary-lab" },
+
+  { "ParameterKey": "VpcId", "ParameterValue": "vpc-0123456789abcdef0" },
+  { "ParameterKey": "PublicSubnetIds", "ParameterValue": "subnet-0aaaaaaaaaaaaaaaa,subnet-0bbbbbbbbbbbbbbbb" },
+
+  { "ParameterKey": "ImageTag", "ParameterValue": "v1" },
+
+  { "ParameterKey": "StableDesiredCount", "ParameterValue": "2" },
+  { "ParameterKey": "CanaryDesiredCount", "ParameterValue": "0" },
+
+  { "ParameterKey": "AlarmPeriod", "ParameterValue": "60" },
+  { "ParameterKey": "AlarmEvaluationPeriods", "ParameterValue": "1" },
+  { "ParameterKey": "Alarm5xxThreshold", "ParameterValue": "3" },
+  { "ParameterKey": "AlarmLatencyThresholdSeconds", "ParameterValue": "1" }
+]
