@@ -76,10 +76,6 @@ push: ## Build and push the image (make push TAG=v2)
 
 ##@ Infrastructure (Terraform)
 
-.PHONY: vpc
-vpc: ## List existing VPCs and subnets you could reuse
-	$(SCRIPTS)/discover-vpc.sh --region $(REGION)
-
 .PHONY: tf-init tf-plan tf-apply tf-destroy
 tf-init: ## terraform init
 	terraform -chdir=$(TF_DIR) init

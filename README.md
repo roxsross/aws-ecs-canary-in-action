@@ -17,17 +17,13 @@ mientras movés los pesos del balanceador.
 BUILD · DEPLOY · EVOLVE
 ```
 
----
-
 ## Qué vas a practicar
 
 - Repartir tráfico real con **weighted target groups** de un ALB (95/5, 50/50, 100/0).
 - Ver la distribución **en vivo**, comparando lo que pediste con lo que realmente pasa.
 - **Simular un incidente de forma controlada** y ver cómo las alarmas de
   CloudWatch disparan el **rollback automático**.
-- Encadenarlo en **CI/CD con GitHub Actions**, usando OIDC (sin claves de acceso).
-
----
+- Todo esto en **CI/CD con GitHub Actions**, usando OIDC (sin claves de acceso).
 
 ## Arquitectura
 
@@ -70,7 +66,8 @@ dos versiones corren siempre; lo que cambia es el peso que reciben. Eso hace que
 el rollback sea instantáneo (reescribir dos números) y que las dos versiones
 sean observables al mismo tiempo con tráfico real.
 
----
+Más detalle de diseño en [docs/architecture.md](docs/architecture.md) y el
+runbook operativo en [docs/canary-playbook.md](docs/canary-playbook.md).
 
 ## Requisitos
 
@@ -95,12 +92,11 @@ configura el [servidor MCP oficial de Terraform](https://developer.hashicorp.com
 (HashiCorp, corre en Docker, sin token), para que el asistente consulte la
 documentación más reciente de providers y módulos del registro público.
 
----
-
-## 1. Correr local, sin cuenta de AWS
+## Quickstart 1: local, sin cuenta de AWS
 
 Levanta un ALB de juguete (`local/mini-alb`) que imita el real: pesos, routing
-forzado, health checks y 503 cuando no hay targets sanos.
+forzado, health checks y 503 cuando no hay targets sanos. Es exactamente el
+flujo que corre en CI en cada pull request.
 
 ```bash
 make local
@@ -129,11 +125,7 @@ Mueve el tráfico y mirá el dashboard reaccionar:
 make local-down
 ```
 
-Es exactamente el flujo que corre en CI en cada pull request.
-
----
-
-## 2. Desplegar en AWS con Terraform
+## Quickstart 2: desplegar en AWS con Terraform
 
 ```bash
 cd infra/terraform
@@ -145,11 +137,24 @@ cd ../..
 make push TAG=v1
 ```
 
+Por defecto, `vpc_id` queda vacío y Terraform crea una VPC mínima solo para el
+laboratorio (subnets públicas + internet gateway). Si ya tenés una VPC y
+preferís usarla, buscá sus datos y pasáselos por `terraform.tfvars`:
+
+```bash
+aws ec2 describe-vpcs --query 'Vpcs[].{Id:VpcId,Cidr:CidrBlock}'
+aws ec2 describe-subnets --filters Name=vpc-id,Values=<tu-vpc-id> \
+  --query 'Subnets[].{Id:SubnetId,Az:AvailabilityZone,Public:MapPublicIpOnLaunch}'
+
+cp infra/terraform/terraform.tfvars.example infra/terraform/terraform.tfvars
+# completá vpc_id y public_subnet_ids con lo que devolvió describe-subnets
+```
+
+Con `vpc_id` seteado, Terraform no crea nada de red y usa la tuya.
+
 ### Qué crea `terraform apply`
 
-- **Red**: si dejás `vpc_id` vacío (default), crea una VPC mínima solo para el
-  laboratorio: subnets públicas + internet gateway. Si pasás `vpc_id` y
-  `public_subnet_ids` en `terraform.tfvars`, no crea nada de red y usa la tuya.
+- **Red**: la VPC del lab o la que referenciaste (ver arriba).
 - **ALB** con dos target groups (`stable`, `canary`) y un listener con regla
   ponderada por defecto, más reglas de routing forzado (`?track=`, header
   `X-Canary`).
@@ -166,23 +171,9 @@ make push TAG=v1
 `./scripts/load-env.sh` traduce las salidas de Terraform a `.canary.env`, que el
 resto de los scripts lee. Volvé a correrlo después de cada `apply`.
 
-Para usar tu propia VPC en vez de que Terraform cree una:
-
-```bash
-aws ec2 describe-vpcs --query 'Vpcs[].{Id:VpcId,Cidr:CidrBlock}'
-aws ec2 describe-subnets --filters Name=vpc-id,Values=<tu-vpc-id> \
-  --query 'Subnets[].{Id:SubnetId,Az:AvailabilityZone,Public:MapPublicIpOnLaunch}'
-# o: ./scripts/discover-vpc.sh --format tfvars
-
-cp infra/terraform/terraform.tfvars.example infra/terraform/terraform.tfvars
-# descomentá vpc_id y public_subnet_ids
-```
-
 Los pesos del listener y el `desired_count` de la canary están protegidos con
 `ignore_changes`, así que un `terraform apply` a mitad de un rollout no te pisa
 el reparto de tráfico.
-
----
 
 ## El dashboard
 
@@ -208,8 +199,6 @@ curl -H 'X-Canary: always' "http://$ALB/" # por header
 
 El mismo número (porcentaje de tráfico de la canary) también está en
 CloudWatch: `terraform output cloudwatch_dashboard_url`.
-
----
 
 ## Demo A: el rollout que sale bien
 
@@ -255,8 +244,6 @@ A mano:
 ./scripts/chaos.sh --clear  # desactiva la inyección de fallos
 ```
 
----
-
 ## Comandos
 
 ```bash
@@ -278,8 +265,6 @@ make help
 | `make clean` | borra artefactos locales y `.canary.env` |
 
 Cada script acepta `--help`.
-
----
 
 ## Pruebas: cómo correrlas y dónde ver el resultado
 
@@ -372,56 +357,6 @@ principio de este README refleja el estado del último run en `main`. Los pasos
 de Terraform (`fmt`, `validate`, `plan`) además escriben un resumen legible en
 el **Job Summary** de cada ejecución, con el plan completo cuando aplica.
 
----
-
-## Costos
-
-Estimación en `us-east-1` con la configuración por defecto (2 tareas estables de
-0.25 vCPU, ALB, DynamoDB on-demand, 4 alarmas):
-
-| Recurso | Aproximado |
-|---|---|
-| Application Load Balancer | USD 0,023 / hora |
-| Fargate, 2 tareas | USD 0,025 / hora |
-| DynamoDB, CloudWatch, logs | centavos con tráfico de laboratorio |
-| **Total** | **≈ USD 0,05 / hora, ≈ USD 35 / mes** |
-
-El ALB cobra aunque no haya tráfico. **Destruí el laboratorio cuando termines:**
-
-```bash
-cd infra/terraform && terraform destroy
-```
-
-Si `build-push.sh` creó el repositorio de ECR (el flujo por defecto), borralo
-aparte:
-
-```bash
-aws ecr delete-repository --repository-name canary-lab-app --force
-```
-
----
-
-## Seguridad: lee esto antes de dejarlo encendido
-
-Este repositorio es material didáctico y sus valores por defecto priorizan que
-puedas compartir el dashboard con tu audiencia:
-
-- **El ALB escucha en HTTP y acepta `0.0.0.0/0`.** Limitalo a tu IP con
-  `allowed_ingress_cidrs = ["TU.IP/32"]`. Para algo serio, pon HTTPS con ACM.
-- **`/api/chaos` y `/api/reset` no piden autenticación.** Cualquiera que llegue
-  al ALB puede romper tu canary. Define `admin_token` en `terraform.tfvars` y
-  los endpoints van a exigir la cabecera `X-Admin-Token`.
-- **El token viaja como variable de entorno de la task definition**, visible en
-  la consola. Para un secreto real, usa Secrets Manager.
-- Las tareas salen a internet con IP pública para poder bajar la imagen sin NAT
-  gateway. Es lo más barato, no lo más aislado.
-
-`make lint-trivy` corre [Trivy](https://trivy.dev) (sucesor de tfsec) contra el
-Terraform. Los hallazgos de arriba están suprimidos inline en los `.tf` con
-comentarios `#trivy:ignore` y su justificación.
-
----
-
 ## Si algo no funciona
 
 | Síntoma | Causa probable |
@@ -436,8 +371,6 @@ comentarios `#trivy:ignore` y su justificación.
 ```bash
 aws logs tail /ecs/canary-lab --since 15m --follow
 ```
-
----
 
 ## Estructura
 
@@ -482,7 +415,6 @@ aws-ecs-canary-in-action/
 ├── scripts/                    El flujo canary, cada uno con --help
 │   ├── build-push.sh            build + push de la imagen a ECR
 │   ├── load-env.sh              terraform output -> .canary.env
-│   ├── discover-vpc.sh          lista VPCs/subnets existentes para usar en tfvars
 │   ├── weights.sh                lee o cambia los pesos del listener
 │   ├── canary-deploy.sh          rollout progresivo con bake time y rollback automático
 │   ├── promote.sh                promueve la canary a estable
@@ -509,10 +441,38 @@ aws-ecs-canary-in-action/
 └── Makefile                    todos los comandos anteriores, con `make help`
 ```
 
-Más detalle en [docs/architecture.md](docs/architecture.md) y el runbook en
-[docs/canary-playbook.md](docs/canary-playbook.md).
+## Seguridad y limpieza: lee esto antes de dejarlo encendido
 
----
+Este repositorio es material didáctico y sus valores por defecto priorizan que
+puedas compartir el dashboard con tu audiencia:
+
+- **El ALB escucha en HTTP y acepta `0.0.0.0/0`.** Limitalo a tu IP con
+  `allowed_ingress_cidrs = ["TU.IP/32"]`. Para algo serio, pon HTTPS con ACM.
+- **`/api/chaos` y `/api/reset` no piden autenticación.** Cualquiera que llegue
+  al ALB puede romper tu canary. Define `admin_token` en `terraform.tfvars` y
+  los endpoints van a exigir la cabecera `X-Admin-Token`.
+- **El token viaja como variable de entorno de la task definition**, visible en
+  la consola. Para un secreto real, usa Secrets Manager.
+- Las tareas salen a internet con IP pública para poder bajar la imagen sin NAT
+  gateway. Es lo más barato, no lo más aislado.
+
+`make lint-trivy` corre [Trivy](https://trivy.dev) (sucesor de tfsec) contra el
+Terraform. Los hallazgos de arriba están suprimidos inline en los `.tf` con
+comentarios `#trivy:ignore` y su justificación.
+
+**El ALB y las tareas de Fargate cobran por hora, tengan tráfico o no.**
+Cuando termines de practicar, destruí el laboratorio:
+
+```bash
+cd infra/terraform && terraform destroy
+```
+
+Si `build-push.sh` creó el repositorio de ECR (el flujo por defecto), Terraform
+no lo gestiona y hay que borrarlo aparte:
+
+```bash
+aws ecr delete-repository --repository-name canary-lab-app --force
+```
 
 ## Licencia
 

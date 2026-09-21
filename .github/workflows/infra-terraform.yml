@@ -107,7 +107,7 @@ jobs:
           if [ -z "${TF_VPC_ID}" ] || [ -z "${TF_PUBLIC_SUBNET_IDS}" ]; then
             echo "set the TF_VPC_ID and TF_PUBLIC_SUBNET_IDS repository variables (or leave them" >&2
             echo "unset and drop -var vpc_id/-var public_subnet_ids below to let Terraform create a VPC)" >&2
-            echo "find them with: ./scripts/discover-vpc.sh --format tfvars" >&2
+            echo "find them with: aws ec2 describe-vpcs / describe-subnets" >&2
             exit 1
           fi
 
