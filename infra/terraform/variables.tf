@@ -141,34 +141,57 @@ variable "task_memory" {
   default     = "512"
 }
 
-variable "stable_desired_count" {
-  description = "Tasks running the stable version."
+variable "desired_count" {
+  description = "Tasks running in the service. During a canary deployment ECS temporarily runs both the current and new revision side by side."
   type        = number
   default     = 2
 }
 
-variable "canary_desired_count" {
-  description = "Tasks running the canary version. Starts at 0: scripts/canary-deploy.sh scales it up when a rollout begins."
-  type        = number
-  default     = 0
-}
-
-variable "stable_app_version" {
-  description = "APP_VERSION reported by the stable tasks."
+variable "app_version" {
+  description = "APP_VERSION reported by the running tasks. Bump it on each rollout so the dashboard shows which revision answered."
   type        = string
   default     = "1.0.0"
-}
-
-variable "canary_app_version" {
-  description = "APP_VERSION reported by the canary tasks."
-  type        = string
-  default     = "2.0.0"
 }
 
 variable "enable_execute_command" {
   description = "Enable ECS Exec so you can shell into a task for debugging."
   type        = bool
   default     = true
+}
+
+# ---- Native ECS canary deployment (deployment_configuration) ----
+
+variable "canary_percent" {
+  description = "Percentage of production traffic shifted to the new revision during the canary phase."
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.canary_percent >= 0.1 && var.canary_percent <= 100
+    error_message = "canary_percent must be between 0.1 and 100."
+  }
+}
+
+variable "canary_bake_time_in_minutes" {
+  description = "Minutes to hold the canary traffic split before shifting the rest, if the alarms below stay OK."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.canary_bake_time_in_minutes >= 0 && var.canary_bake_time_in_minutes <= 1440
+    error_message = "canary_bake_time_in_minutes must be between 0 and 1440."
+  }
+}
+
+variable "bake_time_in_minutes" {
+  description = "Minutes both revisions run side by side after 100% of traffic has shifted, before ECS terminates the old one. Gives an instant traffic rollback window without a redeploy."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.bake_time_in_minutes >= 0 && var.bake_time_in_minutes <= 1440
+    error_message = "bake_time_in_minutes must be between 0 and 1440."
+  }
 }
 
 # ---- Load balancer behaviour ----
@@ -272,12 +295,6 @@ variable "alarm_sns_topic_arns" {
 }
 
 # ---- App configuration ----
-
-variable "grant_listener_read" {
-  description = "Allow tasks to read the listener rules so the dashboard can show the real configured weights."
-  type        = bool
-  default     = true
-}
 
 variable "admin_token" {
   description = "When set, /api/chaos and /api/reset require the X-Admin-Token header. Leave empty for an open lab."

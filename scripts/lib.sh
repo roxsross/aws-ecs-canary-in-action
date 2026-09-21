@@ -118,59 +118,14 @@ confirm() {
 
 # --------------------------------------------------------- load balancer ----
 
-alb_default_target_groups() {
-  # shellcheck disable=SC2016  # backticks are JMESPath literals
+# Reads whichever target group the production listener rule currently forwards
+# to (100% of it: ECS's native canary strategy uses a single forward action
+# with no per-target-group weight, unlike the old hand-rolled listener).
+alb_production_target_group() {
   awsx elbv2 describe-rules \
-    --listener-arn "$CANARY_LISTENER_ARN" \
-    --query 'Rules[?IsDefault==`true`]|[0].Actions[0].ForwardConfig.TargetGroups' \
-    --output json
-}
-
-alb_weights() {
-  local json stable canary
-  json="$(alb_default_target_groups)" || return 1
-  stable="$(printf '%s' "$json" | jq -r --arg tg "$CANARY_TG_STABLE" \
-    '[.[] | select(.TargetGroupArn == $tg) | .Weight] | first // 0')"
-  canary="$(printf '%s' "$json" | jq -r --arg tg "$CANARY_TG_CANARY" \
-    '[.[] | select(.TargetGroupArn == $tg) | .Weight] | first // 0')"
-  printf '%s %s\n' "$stable" "$canary"
-}
-
-alb_canary_percent() {
-  local pair stable canary total
-  pair="$(alb_weights)" || return 1
-  stable="${pair%% *}"
-  canary="${pair##* }"
-  total=$((stable + canary))
-  if [ "$total" -le 0 ]; then
-    printf '0\n'
-  else
-    printf '%s\n' $((canary * 100 / total))
-  fi
-}
-
-alb_set_weights() {
-  local stable="$1" canary="$2" actions
-  actions="$(
-    jq -nc \
-      --arg stableTg "$CANARY_TG_STABLE" \
-      --arg canaryTg "$CANARY_TG_CANARY" \
-      --argjson stableWeight "$stable" \
-      --argjson canaryWeight "$canary" \
-      '[{
-         Type: "forward",
-         ForwardConfig: {
-           TargetGroups: [
-             { TargetGroupArn: $stableTg, Weight: $stableWeight },
-             { TargetGroupArn: $canaryTg, Weight: $canaryWeight }
-           ],
-           TargetGroupStickinessConfig: { Enabled: false }
-         }
-       }]'
-  )"
-  awsx elbv2 modify-listener \
-    --listener-arn "$CANARY_LISTENER_ARN" \
-    --default-actions "$actions" >/dev/null
+    --rule-arns "$CANARY_PRODUCTION_RULE_ARN" \
+    --query 'Rules[0].Actions[0].TargetGroupArn' \
+    --output text
 }
 
 # ----------------------------------------------------------- target health --
@@ -209,61 +164,53 @@ tg_wait_healthy() {
 }
 
 # -------------------------------------------------------------------- ECS ----
+# One service now, using ECS's native CANARY deployment strategy: a rollout is
+# `update-service --task-definition ... --force-new-deployment`, and ECS itself
+# creates the "green" revision, shifts the production listener rule between the
+# primary/alternate target groups, watches the alarms and rolls back if one
+# fires. These helpers just read that state; they don't drive it step by step
+# the way the old two-service design did.
 
 ecs_service_json() {
   awsx ecs describe-services \
     --cluster "$CANARY_CLUSTER" \
-    --services "$1" \
+    --services "$CANARY_SERVICE" \
     --query 'services[0]' \
     --output json
 }
 
 ecs_desired_count() {
-  ecs_service_json "$1" | jq -r '.desiredCount // 0'
-}
-
-ecs_running_count() {
-  ecs_service_json "$1" | jq -r '.runningCount // 0'
+  ecs_service_json | jq -r '.desiredCount // 0'
 }
 
 ecs_task_definition() {
-  ecs_service_json "$1" | jq -r '.taskDefinition // ""'
+  ecs_service_json | jq -r '.taskDefinition // ""'
 }
 
-ecs_scale() {
-  awsx ecs update-service \
-    --cluster "$CANARY_CLUSTER" \
-    --service "$1" \
-    --desired-count "$2" >/dev/null
+ecs_rollout_state() {
+  ecs_service_json | jq -r '[.deployments[]? | select(.status == "PRIMARY")][0].rolloutState // "UNKNOWN"'
 }
 
-# Points a service at a task definition and forces a new deployment.
-ecs_set_task_definition() {
-  awsx ecs update-service \
-    --cluster "$CANARY_CLUSTER" \
-    --service "$1" \
-    --task-definition "$2" \
-    --force-new-deployment >/dev/null
+# Echoes the image currently used by the service's task definition.
+ecs_current_image() {
+  local task_def
+  task_def="$(ecs_task_definition)"
+  [ -n "$task_def" ] || return 1
+  awsx ecs describe-task-definition --task-definition "$task_def" \
+    --query "taskDefinition.containerDefinitions[?name=='${CANARY_CONTAINER_NAME:-app}'].image | [0]" \
+    --output text
 }
 
-ecs_wait_stable() {
-  local service="$1"
-  info "waiting for ${service} to reach a steady state (up to 10 min)"
-  if awsx ecs wait services-stable --cluster "$CANARY_CLUSTER" --services "$service"; then
-    ok "${service} is stable"
-    return 0
-  fi
-  err "${service} did not stabilise"
-  return 1
-}
-
-# Registers a copy of a task definition family with a new image.
-# Echoes the new task definition ARN.
+# Registers a copy of the task definition family with a new image and
+# APP_VERSION. Echoes the new task definition ARN.
 ecs_register_with_image() {
-  local family="$1" image="$2" current new_def
-  current="$(awsx ecs describe-task-definition --task-definition "$family" \
+  local image="$1" version="$2" current new_def
+  current="$(awsx ecs describe-task-definition --task-definition "$CANARY_TASKDEF_FAMILY" \
     --query 'taskDefinition' --output json)"
-  new_def="$(printf '%s' "$current" | jq --arg image "$image" --arg name "${CANARY_CONTAINER_NAME:-app}" '
+  new_def="$(printf '%s' "$current" | jq \
+    --arg image "$image" \
+    --arg version "$version" \
+    --arg name "${CANARY_CONTAINER_NAME:-app}" '
     {
       family,
       taskRoleArn,
@@ -276,7 +223,12 @@ ecs_register_with_image() {
       volumes,
       placementConstraints,
       containerDefinitions: (
-        .containerDefinitions | map(if .name == $name then .image = $image else . end)
+        .containerDefinitions | map(
+          if .name == $name then
+            .image = $image
+            | .environment = ((.environment // []) | map(select(.name != "APP_VERSION")) + [{name: "APP_VERSION", value: $version}])
+          else . end
+        )
       )
     }
     | with_entries(select(.value != null))
@@ -287,14 +239,45 @@ ecs_register_with_image() {
     --output text
 }
 
-# Echoes the image currently used by a service's task definition.
-ecs_current_image() {
-  local service="$1" task_def
-  task_def="$(ecs_task_definition "$service")"
-  [ -n "$task_def" ] || return 1
-  awsx ecs describe-task-definition --task-definition "$task_def" \
-    --query "taskDefinition.containerDefinitions[?name=='${CANARY_CONTAINER_NAME:-app}'].image | [0]" \
-    --output text
+# Starts a canary rollout: register the new task definition, then update the
+# service. ECS takes it from there (green revision, traffic shift, bake time,
+# alarm watch, rollback), driven entirely by deployment_configuration in
+# Terraform. Echoes the new task definition ARN.
+ecs_start_rollout() {
+  local image="$1" version="$2" new_taskdef
+  new_taskdef="$(ecs_register_with_image "$image" "$version")"
+  awsx ecs update-service \
+    --cluster "$CANARY_CLUSTER" \
+    --service "$CANARY_SERVICE" \
+    --task-definition "$new_taskdef" \
+    --force-new-deployment >/dev/null
+  printf '%s\n' "$new_taskdef"
+}
+
+# Polls rolloutState until it leaves IN_PROGRESS, printing progress. Returns 0
+# for COMPLETED, 1 for anything else (FAILED, or timeout).
+ecs_wait_rollout() {
+  local timeout="${1:-1800}" poll="${2:-15}" waited=0 state
+  while [ "$waited" -lt "$timeout" ]; do
+    state="$(ecs_rollout_state)"
+    case "$state" in
+      COMPLETED)
+        ok "rollout completed"
+        return 0
+        ;;
+      FAILED)
+        err "rollout failed (ECS rolled back automatically if alarms/rollback were enabled)"
+        return 1
+        ;;
+      *)
+        info "rollout state: ${state} (${waited}s elapsed)"
+        ;;
+    esac
+    sleep "$poll"
+    waited=$((waited + poll))
+  done
+  err "timed out after ${timeout}s waiting for the rollout to finish, last state: $(ecs_rollout_state)"
+  return 1
 }
 
 # ----------------------------------------------------------------- alarms ----

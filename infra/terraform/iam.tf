@@ -1,5 +1,5 @@
 # Two roles, as ECS expects: execution role pulls the image and writes logs,
-# task role is used by the app itself (DynamoDB, listener read).
+# task role is used by the app itself (DynamoDB).
 
 data "aws_iam_policy_document" "ecs_assume_role" {
   statement {
@@ -53,18 +53,6 @@ data "aws_iam_policy_document" "task" {
     resources = [aws_dynamodb_table.traffic.arn]
   }
 
-  # elasticloadbalancing Describe* actions don't support resource-level perms.
-  dynamic "statement" {
-    for_each = var.grant_listener_read ? [1] : []
-
-    content {
-      sid       = "ReadListenerWeights"
-      effect    = "Allow"
-      actions   = ["elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeListeners"]
-      resources = ["*"]
-    }
-  }
-
   dynamic "statement" {
     for_each = var.enable_execute_command ? [1] : []
 
@@ -88,4 +76,36 @@ resource "aws_iam_role_policy" "task" {
   name   = "${local.name}-task"
   role   = aws_iam_role.task.id
   policy = data.aws_iam_policy_document.task.json
+}
+
+# Lets ECS itself create/modify the alternate target group and rewrite the
+# production listener rule's weights during a canary deployment. Without this
+# role, deployment_configuration.strategy = "CANARY" cannot move any traffic.
+data "aws_iam_policy_document" "ecs_infrastructure_assume_role" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["ecs.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [local.account_id]
+    }
+  }
+}
+
+resource "aws_iam_role" "ecs_infrastructure" {
+  name               = "${local.name}-ecs-infra"
+  assume_role_policy = data.aws_iam_policy_document.ecs_infrastructure_assume_role.json
+  description        = "Lets ECS manage ALB target groups and listener rules during canary deployments"
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_infrastructure" {
+  role       = aws_iam_role.ecs_infrastructure.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonECSInfrastructureRolePolicyForLoadBalancers"
 }

@@ -1,17 +1,18 @@
-# Alarms scoped to the canary target group only. scripts/canary-deploy.sh polls
-# them between traffic steps: any ALARM aborts the rollout and shifts traffic
-# back to stable.
+# Alarms scoped to the alternate target group: that's where ECS runs the new
+# revision during a canary deployment. aws_ecs_service.app.alarms references
+# these by name, so ECS itself watches them and rolls back automatically —
+# no polling script needed.
 
 resource "aws_cloudwatch_metric_alarm" "canary_5xx" {
   alarm_name        = local.alarm_names.canary_5xx
-  alarm_description = "Canary target group is returning 5xx responses"
+  alarm_description = "The new revision (alternate target group) is returning 5xx responses"
 
   namespace   = "AWS/ApplicationELB"
   metric_name = "HTTPCode_Target_5XX_Count"
   statistic   = "Sum"
 
   dimensions = {
-    TargetGroup  = aws_lb_target_group.canary.arn_suffix
+    TargetGroup  = aws_lb_target_group.alternate.arn_suffix
     LoadBalancer = aws_lb.this.arn_suffix
   }
 
@@ -25,19 +26,19 @@ resource "aws_cloudwatch_metric_alarm" "canary_5xx" {
   alarm_actions = var.alarm_sns_topic_arns
   ok_actions    = var.alarm_sns_topic_arns
 
-  tags = { Name = local.alarm_names.canary_5xx, Track = "canary" }
+  tags = { Name = local.alarm_names.canary_5xx }
 }
 
 resource "aws_cloudwatch_metric_alarm" "canary_latency" {
   alarm_name        = local.alarm_names.canary_latency
-  alarm_description = "Canary p95 latency is above the agreed budget"
+  alarm_description = "The new revision's p95 latency is above the agreed budget"
 
   namespace          = "AWS/ApplicationELB"
   metric_name        = "TargetResponseTime"
   extended_statistic = "p95"
 
   dimensions = {
-    TargetGroup  = aws_lb_target_group.canary.arn_suffix
+    TargetGroup  = aws_lb_target_group.alternate.arn_suffix
     LoadBalancer = aws_lb.this.arn_suffix
   }
 
@@ -50,19 +51,19 @@ resource "aws_cloudwatch_metric_alarm" "canary_latency" {
   alarm_actions = var.alarm_sns_topic_arns
   ok_actions    = var.alarm_sns_topic_arns
 
-  tags = { Name = local.alarm_names.canary_latency, Track = "canary" }
+  tags = { Name = local.alarm_names.canary_latency }
 }
 
 resource "aws_cloudwatch_metric_alarm" "canary_unhealthy" {
   alarm_name        = local.alarm_names.canary_unhealthy
-  alarm_description = "Canary target group has unhealthy targets"
+  alarm_description = "The new revision's target group has unhealthy targets"
 
   namespace   = "AWS/ApplicationELB"
   metric_name = "UnHealthyHostCount"
   statistic   = "Maximum"
 
   dimensions = {
-    TargetGroup  = aws_lb_target_group.canary.arn_suffix
+    TargetGroup  = aws_lb_target_group.alternate.arn_suffix
     LoadBalancer = aws_lb.this.arn_suffix
   }
 
@@ -75,16 +76,18 @@ resource "aws_cloudwatch_metric_alarm" "canary_unhealthy" {
   alarm_actions = var.alarm_sns_topic_arns
   ok_actions    = var.alarm_sns_topic_arns
 
-  tags = { Name = local.alarm_names.canary_unhealthy, Track = "canary" }
+  tags = { Name = local.alarm_names.canary_unhealthy }
 }
 
 # Error rate from the app's own embedded metrics (EMF), catches application
-# level failures that never reach the ALB as a 5xx.
+# level failures that never reach the ALB as a 5xx. Both revisions share the
+# same EMF namespace with no per-revision dimension (there's no fixed "canary"
+# track anymore), so this looks at the app's overall error rate.
 resource "aws_cloudwatch_metric_alarm" "canary_error_rate" {
   count = var.enable_emf_alarm ? 1 : 0
 
   alarm_name        = local.alarm_names.canary_error_rate
-  alarm_description = "Canary application error rate above ${var.alarm_error_rate_threshold}%"
+  alarm_description = "Application error rate above ${var.alarm_error_rate_threshold}%"
 
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = var.alarm_evaluation_periods
@@ -94,7 +97,7 @@ resource "aws_cloudwatch_metric_alarm" "canary_error_rate" {
   metric_query {
     id          = "error_rate"
     expression  = "IF(requests > 0, 100 * errors / requests, 0)"
-    label       = "Canary error rate (%)"
+    label       = "Application error rate (%)"
     return_data = true
   }
 
@@ -106,7 +109,6 @@ resource "aws_cloudwatch_metric_alarm" "canary_error_rate" {
       metric_name = "ErrorCount"
       period      = var.alarm_period
       stat        = "Sum"
-      dimensions  = { Track = "canary" }
     }
   }
 
@@ -118,17 +120,17 @@ resource "aws_cloudwatch_metric_alarm" "canary_error_rate" {
       metric_name = "RequestCount"
       period      = var.alarm_period
       stat        = "Sum"
-      dimensions  = { Track = "canary" }
     }
   }
 
   alarm_actions = var.alarm_sns_topic_arns
   ok_actions    = var.alarm_sns_topic_arns
 
-  tags = { Name = local.alarm_names.canary_error_rate, Track = "canary" }
+  tags = { Name = local.alarm_names.canary_error_rate }
 }
 
-# Dashboard comparing both tracks side by side.
+# Dashboard comparing the primary (current production) and alternate (the
+# revision ECS is rolling out) target groups side by side.
 
 resource "aws_cloudwatch_dashboard" "canary" {
   count = var.enable_dashboard ? 1 : 0
@@ -137,8 +139,10 @@ resource "aws_cloudwatch_dashboard" "canary" {
 
   dashboard_body = jsonencode({
     widgets = [
-      # Canary share of total requests, computed from raw request counts so it
-      # reflects real traffic, not the weight configured on the listener.
+      # New revision's share of total requests, computed from raw request
+      # counts so it reflects real traffic, not the deployment's configured
+      # canary_percent (which only names the *initial* target, not what's
+      # measured live).
       {
         type   = "metric"
         x      = 0
@@ -146,7 +150,7 @@ resource "aws_cloudwatch_dashboard" "canary" {
         width  = 24
         height = 6
         properties = {
-          title  = "Traffic distribution: canary share of total requests (%)"
+          title  = "Traffic distribution: new revision's share of total requests (%)"
           region = var.aws_region
           view   = "timeSeries"
           period = 60
@@ -155,14 +159,14 @@ resource "aws_cloudwatch_dashboard" "canary" {
             left = { min = 0, max = 100, label = "% of total requests" }
           }
           metrics = [
-            ["AWS/ApplicationELB", "RequestCount", "TargetGroup", aws_lb_target_group.stable.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix,
-              { id = "stable_requests", visible = false }
+            ["AWS/ApplicationELB", "RequestCount", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix,
+              { id = "primary_requests", visible = false }
             ],
-            ["AWS/ApplicationELB", "RequestCount", "TargetGroup", aws_lb_target_group.canary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix,
-              { id = "canary_requests", visible = false }
+            ["AWS/ApplicationELB", "RequestCount", "TargetGroup", aws_lb_target_group.alternate.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix,
+              { id = "alternate_requests", visible = false }
             ],
-            [{ expression = "100 * canary_requests / (stable_requests + canary_requests)", label = "canary %", id = "canary_pct", color = "#f472b6" }],
-            [{ expression = "100 * stable_requests / (stable_requests + canary_requests)", label = "stable %", id = "stable_pct", color = "#22d3ee" }],
+            [{ expression = "100 * alternate_requests / (primary_requests + alternate_requests)", label = "new revision %", id = "alt_pct", color = "#f472b6" }],
+            [{ expression = "100 * primary_requests / (primary_requests + alternate_requests)", label = "current revision %", id = "primary_pct", color = "#22d3ee" }],
           ]
         }
       },
@@ -179,8 +183,8 @@ resource "aws_cloudwatch_dashboard" "canary" {
           period = 60
           stat   = "Sum"
           metrics = [
-            ["AWS/ApplicationELB", "RequestCount", "TargetGroup", aws_lb_target_group.stable.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { label = "stable" }],
-            ["...", aws_lb_target_group.canary.arn_suffix, ".", aws_lb.this.arn_suffix, { label = "canary" }],
+            ["AWS/ApplicationELB", "RequestCount", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { label = "primary" }],
+            ["...", aws_lb_target_group.alternate.arn_suffix, ".", aws_lb.this.arn_suffix, { label = "alternate" }],
           ]
         }
       },
@@ -197,8 +201,8 @@ resource "aws_cloudwatch_dashboard" "canary" {
           period = 60
           stat   = "Sum"
           metrics = [
-            ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "TargetGroup", aws_lb_target_group.stable.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { label = "stable 5xx" }],
-            ["...", aws_lb_target_group.canary.arn_suffix, ".", aws_lb.this.arn_suffix, { label = "canary 5xx", color = "#d62728" }],
+            ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { label = "primary 5xx" }],
+            ["...", aws_lb_target_group.alternate.arn_suffix, ".", aws_lb.this.arn_suffix, { label = "alternate 5xx", color = "#d62728" }],
           ]
           annotations = {
             horizontal = [
@@ -220,8 +224,8 @@ resource "aws_cloudwatch_dashboard" "canary" {
           period = 60
           stat   = "p95"
           metrics = [
-            ["AWS/ApplicationELB", "TargetResponseTime", "TargetGroup", aws_lb_target_group.stable.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { label = "stable p95" }],
-            ["...", aws_lb_target_group.canary.arn_suffix, ".", aws_lb.this.arn_suffix, { label = "canary p95", color = "#d62728" }],
+            ["AWS/ApplicationELB", "TargetResponseTime", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { label = "primary p95" }],
+            ["...", aws_lb_target_group.alternate.arn_suffix, ".", aws_lb.this.arn_suffix, { label = "alternate p95", color = "#d62728" }],
           ]
           annotations = {
             horizontal = [
@@ -243,9 +247,9 @@ resource "aws_cloudwatch_dashboard" "canary" {
           period = 60
           stat   = "Average"
           metrics = [
-            ["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", aws_lb_target_group.stable.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { label = "stable healthy" }],
-            ["...", aws_lb_target_group.canary.arn_suffix, ".", aws_lb.this.arn_suffix, { label = "canary healthy" }],
-            ["AWS/ApplicationELB", "UnHealthyHostCount", "TargetGroup", aws_lb_target_group.canary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { label = "canary unhealthy", color = "#d62728" }],
+            ["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { label = "primary healthy" }],
+            ["...", aws_lb_target_group.alternate.arn_suffix, ".", aws_lb.this.arn_suffix, { label = "alternate healthy" }],
+            ["AWS/ApplicationELB", "UnHealthyHostCount", "TargetGroup", aws_lb_target_group.alternate.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { label = "alternate unhealthy", color = "#d62728" }],
           ]
         }
       },
@@ -256,15 +260,14 @@ resource "aws_cloudwatch_dashboard" "canary" {
         width  = 12
         height = 6
         properties = {
-          title  = "Application metrics (EMF) by track"
+          title  = "Application metrics (EMF)"
           region = var.aws_region
           view   = "timeSeries"
           period = 60
           stat   = "Sum"
           metrics = [
-            [var.metrics_namespace, "RequestCount", "Track", "stable", { label = "stable requests" }],
-            ["...", "canary", { label = "canary requests" }],
-            [var.metrics_namespace, "ErrorCount", "Track", "canary", { label = "canary errors", color = "#d62728" }],
+            [var.metrics_namespace, "RequestCount", { label = "requests" }],
+            [var.metrics_namespace, "ErrorCount", { label = "errors", color = "#d62728" }],
           ]
         }
       },
@@ -275,15 +278,8 @@ resource "aws_cloudwatch_dashboard" "canary" {
         width  = 12
         height = 6
         properties = {
-          title = "Canary rollback triggers"
-          alarms = concat(
-            [
-              aws_cloudwatch_metric_alarm.canary_5xx.arn,
-              aws_cloudwatch_metric_alarm.canary_latency.arn,
-              aws_cloudwatch_metric_alarm.canary_unhealthy.arn,
-            ],
-            var.enable_emf_alarm ? [aws_cloudwatch_metric_alarm.canary_error_rate[0].arn] : [],
-          )
+          title  = "Canary rollback triggers"
+          alarms = local.rollback_alarm_arns
         }
       },
     ]

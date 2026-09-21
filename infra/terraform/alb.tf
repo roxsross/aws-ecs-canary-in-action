@@ -1,5 +1,9 @@
-# ALB with two target groups and a weighted default rule. scripts/canary-deploy.sh
-# shifts the weights from 100/0 to 0/100 one step at a time.
+# ALB using ECS's native canary deployment strategy (deployment_configuration
+# in ecs.tf). Two target groups, "primary" (current production revision) and
+# "alternate" (the revision ECS is rolling out); ECS itself moves the listener
+# rule weights during a deployment via load_balancer.advanced_configuration.
+# Terraform only owns the initial 100/0 state and the rule; it does not touch
+# weights afterwards, the same way it never touched them in the old design.
 
 resource "aws_lb" "this" {
   name = "${local.name}-alb"
@@ -16,8 +20,8 @@ resource "aws_lb" "this" {
   tags = { Name = "${local.name}-alb" }
 }
 
-resource "aws_lb_target_group" "stable" {
-  name        = "${local.name}-stable"
+resource "aws_lb_target_group" "primary" {
+  name        = "${local.name}-primary"
   port        = var.container_port
   protocol    = "HTTP"
   vpc_id      = local.vpc_id
@@ -36,15 +40,15 @@ resource "aws_lb_target_group" "stable" {
     unhealthy_threshold = var.unhealthy_threshold
   }
 
-  tags = { Name = "${local.name}-stable", Track = "stable" }
+  tags = { Name = "${local.name}-primary" }
 
   lifecycle {
     create_before_destroy = true
   }
 }
 
-resource "aws_lb_target_group" "canary" {
-  name        = "${local.name}-canary"
+resource "aws_lb_target_group" "alternate" {
+  name        = "${local.name}-alternate"
   port        = var.container_port
   protocol    = "HTTP"
   vpc_id      = local.vpc_id
@@ -63,7 +67,7 @@ resource "aws_lb_target_group" "canary" {
     unhealthy_threshold = var.unhealthy_threshold
   }
 
-  tags = { Name = "${local.name}-canary", Track = "canary" }
+  tags = { Name = "${local.name}-alternate" }
 
   lifecycle {
     create_before_destroy = true
@@ -77,107 +81,33 @@ resource "aws_lb_listener" "http" {
   protocol          = "HTTP"
 
   default_action {
-    type = "forward"
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.primary.arn
+  }
+}
 
-    forward {
-      target_group {
-        arn    = aws_lb_target_group.stable.arn
-        weight = 100
-      }
+# ECS requires the production traffic action to live on a listener *rule*, not
+# the listener's own default action, so this is what deployment_configuration
+# points at. ECS rewrites its target group during each deployment; Terraform
+# only sets the initial state.
+resource "aws_lb_listener_rule" "production" {
+  listener_arn = aws_lb_listener.http.arn
+  priority     = 1
 
-      target_group {
-        arn    = aws_lb_target_group.canary.arn
-        weight = 0
-      }
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.primary.arn
+  }
 
-      stickiness {
-        enabled  = false
-        duration = 3600
-      }
+  condition {
+    path_pattern {
+      values = ["/*"]
     }
   }
 
-  # The canary scripts own the weights at runtime; otherwise a mid-rollout
-  # `terraform apply` would snap traffic back to 100/0.
+  tags = { Name = "${local.name}-production" }
+
   lifecycle {
-    ignore_changes = [default_action]
+    ignore_changes = [action]
   }
-}
-
-# Forced routing rules, used by the dashboard's "ver solo esta versión" links.
-
-resource "aws_lb_listener_rule" "force_canary_query" {
-  listener_arn = aws_lb_listener.http.arn
-  priority     = 10
-
-  action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.canary.arn
-  }
-
-  condition {
-    query_string {
-      key   = "track"
-      value = "canary"
-    }
-  }
-
-  tags = { Name = "${local.name}-force-canary-query" }
-}
-
-resource "aws_lb_listener_rule" "force_stable_query" {
-  listener_arn = aws_lb_listener.http.arn
-  priority     = 11
-
-  action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.stable.arn
-  }
-
-  condition {
-    query_string {
-      key   = "track"
-      value = "stable"
-    }
-  }
-
-  tags = { Name = "${local.name}-force-stable-query" }
-}
-
-resource "aws_lb_listener_rule" "force_canary_header" {
-  listener_arn = aws_lb_listener.http.arn
-  priority     = 20
-
-  action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.canary.arn
-  }
-
-  condition {
-    http_header {
-      http_header_name = "X-Canary"
-      values           = ["always"]
-    }
-  }
-
-  tags = { Name = "${local.name}-force-canary-header" }
-}
-
-resource "aws_lb_listener_rule" "force_stable_header" {
-  listener_arn = aws_lb_listener.http.arn
-  priority     = 21
-
-  action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.stable.arn
-  }
-
-  condition {
-    http_header {
-      http_header_name = "X-Canary"
-      values           = ["never"]
-    }
-  }
-
-  tags = { Name = "${local.name}-force-stable-header" }
 }

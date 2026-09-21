@@ -1,5 +1,9 @@
-# One cluster, two services: stable and canary. Same image contract, different
-# TRACK and APP_VERSION, each wired to its own target group.
+# One cluster, one service. Canary behaviour comes from ECS's native
+# deployment_configuration (strategy = CANARY), not from a second service: ECS
+# creates the "green" revision, target group registration and listener rule
+# weighting for you, watches the alarms below, and rolls back on its own if one
+# breaches. See docs/architecture.md for how this replaced the two-service /
+# hand-rolled listener weights design used by local/mini-alb.
 
 resource "aws_ecs_cluster" "this" {
   name = local.name
@@ -30,29 +34,8 @@ resource "aws_cloudwatch_log_group" "app" {
   tags = { Name = local.log_group_name }
 }
 
-locals {
-  tracks = {
-    stable = {
-      family        = local.stable_task_family
-      service       = local.stable_service
-      app_version   = var.stable_app_version
-      desired_count = var.stable_desired_count
-      target_group  = aws_lb_target_group.stable.arn
-    }
-    canary = {
-      family        = local.canary_task_family
-      service       = local.canary_service
-      app_version   = var.canary_app_version
-      desired_count = var.canary_desired_count
-      target_group  = aws_lb_target_group.canary.arn
-    }
-  }
-}
-
-resource "aws_ecs_task_definition" "track" {
-  for_each = local.tracks
-
-  family                   = each.value.family
+resource "aws_ecs_task_definition" "app" {
+  family                   = local.task_family
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
   cpu                      = var.task_cpu
@@ -83,10 +66,7 @@ resource "aws_ecs_task_definition" "track" {
 
       environment = concat(
         local.base_environment,
-        [
-          { name = "TRACK", value = each.key },
-          { name = "APP_VERSION", value = each.value.app_version },
-        ],
+        [{ name = "APP_VERSION", value = var.app_version }],
       )
 
       # No container healthCheck on purpose: the target group health check is
@@ -97,7 +77,7 @@ resource "aws_ecs_task_definition" "track" {
         options = {
           "awslogs-group"         = aws_cloudwatch_log_group.app.name
           "awslogs-region"        = var.aws_region
-          "awslogs-stream-prefix" = each.key
+          "awslogs-stream-prefix" = "app"
         }
       }
 
@@ -105,32 +85,20 @@ resource "aws_ecs_task_definition" "track" {
     },
   ])
 
-  tags = { Name = each.value.family, Track = each.key }
+  tags = { Name = local.task_family }
 }
 
-resource "aws_ecs_service" "track" {
-  for_each = local.tracks
-
-  name            = each.value.service
+resource "aws_ecs_service" "app" {
+  name            = local.service_name
   cluster         = aws_ecs_cluster.this.id
-  task_definition = aws_ecs_task_definition.track[each.key].arn
-  desired_count   = each.value.desired_count
+  task_definition = aws_ecs_task_definition.app.arn
+  desired_count   = var.desired_count
 
   launch_type      = "FARGATE"
   platform_version = "LATEST"
 
   enable_execute_command = var.enable_execute_command
   propagate_tags         = "SERVICE"
-
-  # Deployments within a track are plain rolling updates; canary behaviour
-  # comes from the listener weights, not the service deployment controller.
-  deployment_minimum_healthy_percent = 100
-  deployment_maximum_percent         = 200
-
-  deployment_circuit_breaker {
-    enable   = true
-    rollback = true
-  }
 
   network_configuration {
     subnets          = local.service_subnet_ids
@@ -139,23 +107,47 @@ resource "aws_ecs_service" "track" {
   }
 
   load_balancer {
-    target_group_arn = each.value.target_group
+    target_group_arn = aws_lb_target_group.primary.arn
     container_name   = "app"
     container_port   = var.container_port
+
+    advanced_configuration {
+      alternate_target_group_arn = aws_lb_target_group.alternate.arn
+      production_listener_rule   = aws_lb_listener_rule.production.arn
+      role_arn                   = aws_iam_role.ecs_infrastructure.arn
+    }
   }
 
   health_check_grace_period_seconds = 60
 
-  # scripts/canary-deploy.sh drives these at runtime.
+  deployment_configuration {
+    strategy             = "CANARY"
+    bake_time_in_minutes = var.bake_time_in_minutes
+    canary_configuration {
+      canary_percent              = var.canary_percent
+      canary_bake_time_in_minutes = var.canary_bake_time_in_minutes
+    }
+  }
+
+  alarms {
+    enable      = true
+    rollback    = true
+    alarm_names = local.rollback_alarm_names
+  }
+
+  # A rollout is triggered with `aws ecs update-service --force-new-deployment
+  # --task-definition ...`, not by editing this resource, so Terraform should
+  # not fight the in-flight canary/green revision it created.
   lifecycle {
     ignore_changes = [desired_count, task_definition]
   }
 
   depends_on = [
-    aws_lb_listener.http,
+    aws_lb_listener_rule.production,
     aws_iam_role_policy.task,
     aws_iam_role_policy_attachment.execution_managed,
+    aws_iam_role_policy_attachment.ecs_infrastructure,
   ]
 
-  tags = { Name = each.value.service, Track = each.key }
+  tags = { Name = local.service_name }
 }
