@@ -23,6 +23,8 @@ mientras movés los pesos del balanceador.
   CloudWatch disparan el **rollback automático**.
 - Todo esto en **CI/CD con GitHub Actions**, usando OIDC (sin claves de acceso).
 
+![Contenedores del laboratorio local](docs/images/local2.png)
+
 ## Arquitectura
 
 ```mermaid
