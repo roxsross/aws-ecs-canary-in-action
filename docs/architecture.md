@@ -315,11 +315,13 @@ Si prefieres que Terraform sea dueño del repositorio, pon
 `create_ecr_repository = true`. El URI se calcula igual, así que no aparece
 ninguna dependencia circular.
 
-**Arquitectura del binario.** Fargate espera por defecto `X86_64`. Como mucha gente
-construye en Apple silicon, `build-push.sh` fuerza `--platform linux/amd64`. Si
-quieres tareas ARM, cambia `cpu_architecture` a `ARM64` **y** construye con
-`--platform linux/arm64`. Si los dos no coinciden, la tarea muere con un error de
-formato de ejecutable.
+**Arquitectura del binario.** `build-push.sh` construye con `docker buildx` para
+`linux/amd64,linux/arm64` por defecto y sube un único manifest multi-arquitectura,
+así el tag sirve tanto si `cpu_architecture` es `X86_64` (el default de Fargate)
+como `ARM64`, sin que importe en qué máquina se construyó la imagen. Si pasás
+`--platform` con una sola arquitectura para acelerar el build, esa arquitectura
+tiene que coincidir con `cpu_architecture` en `terraform.tfvars`: si no
+coinciden, la tarea muere con un error de formato de ejecutable.
 
 ---
 

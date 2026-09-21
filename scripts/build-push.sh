@@ -9,8 +9,12 @@
 # an image, so the registry comes first. The repository name defaults to
 # <project>-app, which is what the Terraform stack expects.
 #
-# Images are built for linux/amd64 by default, so an image built on Apple silicon
-# still runs on Fargate. Override with --platform if your tasks use ARM64.
+# Built with `docker buildx` for linux/amd64,linux/arm64 by default and pushed
+# as a single multi-arch manifest, so the same tag runs on Fargate regardless
+# of var.cpu_architecture (X86_64 or ARM64) and regardless of whether the image
+# was built on an Intel machine, Apple silicon or an ARM CI runner. Override
+# with --platform for a single-arch build (faster, but must then match
+# var.cpu_architecture or the task will fail to start).
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -22,7 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TAG=""
 PROJECT="${PROJECT_NAME:-canary-lab}"
 REPO=""
-PLATFORM="linux/amd64"
+PLATFORM="linux/amd64,linux/arm64"
 APP_DIR="${REPO_ROOT}/app"
 NO_CACHE=false
 PUSH_LATEST=false
@@ -36,7 +40,7 @@ Options
   --tag TAG         Image tag to build and push (required)
   --project NAME    Project prefix, used for the default repo name (default: canary-lab)
   --repo NAME       ECR repository name (default: <project>-app)
-  --platform PLAT   Build platform (default: linux/amd64)
+  --platform PLAT   Comma separated platforms to build (default: linux/amd64,linux/arm64)
   --region REGION   AWS region
   --latest          Also push the tag as :latest
   --no-cache        Build without the layer cache
@@ -128,35 +132,37 @@ if [ "$KEEP_LIFECYCLE" = true ]; then
   fi
 fi
 
-# ------------------------------------------------------------------ build ----
+# --------------------------------------------------------------- buildx ----
 
-step "building ${IMAGE_URI}"
-BUILD_ARGS="--platform ${PLATFORM}"
-[ "$NO_CACHE" = true ] && BUILD_ARGS="${BUILD_ARGS} --no-cache"
-
-# shellcheck disable=SC2086  # BUILD_ARGS is a deliberate list of flags
-docker build $BUILD_ARGS \
-  --build-arg "APP_VERSION=${TAG}" \
-  --build-arg "GIT_SHA=${GIT_SHA}" \
-  --build-arg "BUILD_TIME=${BUILD_TIME}" \
-  --tag "$IMAGE_URI" \
-  "$APP_DIR"
-
-if [ "$PUSH_LATEST" = true ]; then
-  docker tag "$IMAGE_URI" "${REGISTRY}/${REPO}:latest"
-fi
-
-# ------------------------------------------------------------------- push ----
-
+# A multi-platform build must push straight to the registry: it produces one
+# manifest per platform plus the manifest list joining them, and that list
+# cannot be materialised as a single local image with `--load`. So login has
+# to happen before the build, not after.
 step "logging in to ${REGISTRY}"
 awsx ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY" >/dev/null
 ok "authenticated"
 
-step "pushing ${TAG}"
-docker push "$IMAGE_URI"
-if [ "$PUSH_LATEST" = true ]; then
-  docker push "${REGISTRY}/${REPO}:latest"
+step "checking the buildx builder"
+if ! docker buildx inspect canary-lab-builder >/dev/null 2>&1; then
+  docker buildx create --name canary-lab-builder --driver docker-container >/dev/null
+  info "created buildx builder: canary-lab-builder"
 fi
+docker buildx use canary-lab-builder
+
+# ------------------------------------------------------------------ build ----
+
+step "building and pushing ${IMAGE_URI} (${PLATFORM})"
+BUILD_ARGS=(--platform "$PLATFORM" --push --tag "$IMAGE_URI")
+[ "$NO_CACHE" = true ] && BUILD_ARGS+=(--no-cache)
+if [ "$PUSH_LATEST" = true ]; then
+  BUILD_ARGS+=(--tag "${REGISTRY}/${REPO}:latest")
+fi
+
+docker buildx build "${BUILD_ARGS[@]}" \
+  --build-arg "APP_VERSION=${TAG}" \
+  --build-arg "GIT_SHA=${GIT_SHA}" \
+  --build-arg "BUILD_TIME=${BUILD_TIME}" \
+  "$APP_DIR"
 
 DIGEST="$(awsx ecr describe-images \
   --repository-name "$REPO" \

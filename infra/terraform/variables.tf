@@ -125,7 +125,7 @@ variable "task_cpu" {
 }
 
 variable "cpu_architecture" {
-  description = "Must match the architecture the image was built for. scripts/build-push.sh builds linux/amd64 by default, so images built on Apple silicon still run on Fargate."
+  description = "Must match the architecture the image was built for. scripts/build-push.sh builds a multi-arch (amd64+arm64) manifest by default, so X86_64 and ARM64 both work out of the box."
   type        = string
   default     = "X86_64"
 

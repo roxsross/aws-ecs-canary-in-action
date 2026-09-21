@@ -94,9 +94,18 @@ documentación más reciente de providers y módulos del registro público.
 
 ## Quickstart 1: local, sin cuenta de AWS
 
-Levanta un ALB de juguete (`local/mini-alb`) que imita el real: pesos, routing
-forzado, health checks y 503 cuando no hay targets sanos. Es exactamente el
-flujo que corre en CI en cada pull request.
+`make local` levanta con `docker compose` el mismo laboratorio, sin AWS:
+
+- **mini-alb** (`local/mini-alb/server.js`): un balanceador de juguete que
+  imita al ALB real — reparte tráfico por peso, expone routing forzado y
+  devuelve 503 cuando no hay targets sanos.
+- **stable** y **canary**: dos contenedores de la misma app (`app/`), cada uno
+  con su `TRACK`/`APP_VERSION`, igual que los dos servicios ECS reales.
+- **dynamodb-local**: la misma tabla de contadores que en AWS, pero en memoria
+  y sin costo.
+
+Es la misma arquitectura del diagrama de arriba a escala de laptop, y es
+exactamente el flujo que corre en CI en cada pull request.
 
 ```bash
 make local
@@ -137,6 +146,14 @@ cd ../..
 make push TAG=v1
 ```
 
+`make push` construye la imagen con `docker buildx` para **linux/amd64 y
+linux/arm64** y sube un único manifest multi-arquitectura a ECR. Así el mismo
+tag corre en Fargate sin importar si compilaste en Apple silicon, en Intel o en
+un runner de CI, ni cuál sea `var.cpu_architecture` en Terraform. Si preferís
+un build de una sola arquitectura (más rápido), usá
+`./scripts/build-push.sh --tag v1 --platform linux/amd64`, pero entonces esa
+plataforma tiene que coincidir con `var.cpu_architecture` en `terraform.tfvars`.
+
 Por defecto, `vpc_id` queda vacío y Terraform crea una VPC mínima solo para el
 laboratorio (subnets públicas + internet gateway). Si ya tenés una VPC y
 preferís usarla, buscá sus datos y pasáselos por `terraform.tfvars`:
@@ -152,7 +169,13 @@ cp infra/terraform/terraform.tfvars.example infra/terraform/terraform.tfvars
 
 Con `vpc_id` seteado, Terraform no crea nada de red y usa la tuya.
 
-### Qué crea `terraform apply`
+### Terraform: para qué se usa y qué crea
+
+Todo lo que corre en AWS —red, ALB, ECS, DynamoDB, alarmas— está definido en
+[`infra/terraform/`](infra/terraform), sin clics en la consola: el objetivo es
+que el mismo laboratorio se pueda levantar y destruir de forma repetible, en tu
+cuenta o en la de cualquiera que clone el repo, con `terraform apply` /
+`terraform destroy`. `terraform apply` crea:
 
 - **Red**: la VPC del lab o la que referenciaste (ver arriba).
 - **ALB** con dos target groups (`stable`, `canary`) y un listener con regla
@@ -361,7 +384,7 @@ el **Job Summary** de cada ejecución, con el plan completo cuando aplica.
 
 | Síntoma | Causa probable |
 |---|---|
-| Las tareas arrancan y mueren en bucle | la imagen no existe con ese tag, o se construyó para `arm64` con el stack esperando `X86_64` |
+| Las tareas arrancan y mueren en bucle | la imagen no existe con ese tag, o se construyó con `--platform` limitado a una arquitectura que no coincide con `var.cpu_architecture` |
 | `503` desde el ALB | no hay targets sanos. `./scripts/status.sh` y mirá `healthy=` |
 | El dashboard dice "dynamodb (degradado)" | la tabla no existe o al rol de la tarea le falta permiso |
 | El peso del ALB sale como "estimado" | falta `LISTENER_ARN` o el permiso `elasticloadbalancing:DescribeRules` |
