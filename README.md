@@ -15,10 +15,6 @@ mientras movés los pesos del balanceador.
 
 ![ECS Canary in Action](docs/images/nerdearla-canary-ecs.png)
 
-```
-BUILD · DEPLOY · EVOLVE
-```
-
 ## Qué vas a practicar
 
 - Repartir tráfico real con **weighted target groups** de un ALB (95/5, 50/50, 100/0).
