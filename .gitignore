@@ -41,6 +41,9 @@ Thumbs.db
 *.key
 credentials
 
+# ---- kiro local settings (may contain MCP tokens) ----
+.kiro/settings/mcp.json
+
 # ---- misc ----
 tmp/
 out/
