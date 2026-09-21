@@ -7,8 +7,7 @@
 #
 # Runs happily before the infrastructure exists: a service cannot start without
 # an image, so the registry comes first. The repository name defaults to
-# <project>-app, exactly what the Terraform, CloudFormation and CDK flavours
-# expect.
+# <project>-app, which is what the Terraform stack expects.
 #
 # Images are built for linux/amd64 by default, so an image built on Apple silicon
 # still runs on Fargate. Override with --platform if your tasks use ARM64.

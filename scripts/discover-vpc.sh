@@ -1,21 +1,15 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# Optional helper for when you want to reuse a VPC you already have, instead of
-# letting Terraform create one for you (its default). Required for the
-# CloudFormation and CDK flavours, which always need an existing VPC.
+# Helper for reusing a VPC you already have, instead of letting Terraform
+# create one for you (the default).
 #
 #   ./scripts/discover-vpc.sh                        # list what you have
 #   ./scripts/discover-vpc.sh --format tfvars        # terraform.tfvars snippet
-#   ./scripts/discover-vpc.sh --format cdk           # cdk -c flags
-#   ./scripts/discover-vpc.sh --format cfn           # params.json snippet
 #   ./scripts/discover-vpc.sh --vpc-id vpc-0abc... --format tfvars
 #
-# A subnet counts as public when its route table sends 0.0.0.0/0 to an internet
-# gateway, which is what the ALB needs and what lets tasks pull images without
-# a NAT gateway.
+# A subnet counts as public when its route table sends 0.0.0.0/0 to an
+# internet gateway, which is what the ALB needs.
 # ---------------------------------------------------------------------------
-#
-# shellcheck disable=SC2016  # backticks throughout are JMESPath literals, not shell
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,7 +26,7 @@ usage() {
   cat <<'EOF'
 Options
   --vpc-id ID       Use this VPC instead of auto selecting
-  --format FORMAT   table (default) | tfvars | cdk | cfn | env
+  --format FORMAT   table (default) | tfvars | env
   --subnets N       How many public subnets to emit (default: 2)
   --region REGION   AWS region
   -h, --help        This help
@@ -51,16 +45,15 @@ while [ $# -gt 0 ]; do
 done
 
 case "$FORMAT" in
-  table | tfvars | cdk | cfn | env) ;;
-  *) die "unknown format: $FORMAT (use table, tfvars, cdk, cfn or env)" ;;
+  table | tfvars | env) ;;
+  *) die "unknown format: $FORMAT (use table, tfvars or env)" ;;
 esac
 
 require_tools aws jq
 REGION="$(canary_region)"
 
-# ---------------------------------------------------------------- pick a VPC --
-
 vpcs_json() {
+  # shellcheck disable=SC2016  # backticks are JMESPath literals, not shell
   awsx ec2 describe-vpcs \
     --query 'Vpcs[].{id:VpcId,cidr:CidrBlock,isDefault:IsDefault,state:State,name:(Tags[?Key==`Name`].Value | [0])}' \
     --output json
@@ -78,15 +71,13 @@ if [ -z "$VPC_ID" ]; then
     ' >&2
   fi
 
-  # Prefer the default VPC, otherwise the first one.
   VPC_ID="$(printf '%s' "$VPCS" | jq -r '[.[] | select(.isDefault == true)][0].id // .[0].id')"
   if [ "$COUNT" -gt 1 ]; then
     note "using ${VPC_ID} (pass --vpc-id to choose another)"
   fi
 fi
 
-# ------------------------------------------------------------- inspect subnets --
-
+# shellcheck disable=SC2016  # backticks are JMESPath literals, not shell
 SUBNETS="$(awsx ec2 describe-subnets \
   --filters "Name=vpc-id,Values=${VPC_ID}" \
   --query 'Subnets[].{id:SubnetId,az:AvailabilityZone,cidr:CidrBlock,autoPublicIp:MapPublicIpOnLaunch,available:AvailableIpAddressCount,name:(Tags[?Key==`Name`].Value | [0])}' \
@@ -97,9 +88,8 @@ SUBNET_COUNT="$(printf '%s' "$SUBNETS" | jq 'length')"
 
 step "classifying subnets in ${VPC_ID}"
 
-# All route tables in one call, then the public/private decision is made locally:
-# a subnet is public when its associated route table (or the VPC main one, if it
-# has no explicit association) sends 0.0.0.0/0 to an internet gateway.
+# A subnet is public when its own route table (or the VPC main one, if it has
+# no explicit association) sends 0.0.0.0/0 to an internet gateway.
 ROUTE_TABLES="$(awsx ec2 describe-route-tables \
   --filters "Name=vpc-id,Values=${VPC_ID}" \
   --query 'RouteTables' \
@@ -149,8 +139,7 @@ if [ -n "$PRIVATE_ROWS" ]; then
   printf '%s\n' "$PRIVATE_ROWS" >&2
 fi
 
-# One subnet per availability zone: an ALB needs two different AZs, and two
-# subnets in the same AZ would not satisfy it.
+# One subnet per availability zone: the ALB needs two different AZs.
 SELECTED="$(printf '%s' "$CLASSIFIED" | jq -r --argjson want "$WANT_SUBNETS" '
   [.[] | select(.public)]
   | group_by(.az) | map(.[0]) | sort_by(.az)
@@ -183,10 +172,7 @@ case "$FORMAT" in
     info "vpc          ${VPC_ID}"
     info "subnets      ${CSV}"
     hr
-    info "next, pick a flavour:"
-    info "  $0 --vpc-id ${VPC_ID} --format tfvars"
-    info "  $0 --vpc-id ${VPC_ID} --format cdk"
-    info "  $0 --vpc-id ${VPC_ID} --format cfn"
+    info "next:  $0 --vpc-id ${VPC_ID} --format tfvars"
     ;;
   tfvars)
     cat <<EOF
@@ -194,20 +180,6 @@ case "$FORMAT" in
 aws_region        = "${REGION}"
 vpc_id            = "${VPC_ID}"
 public_subnet_ids = ${JSON_LIST}
-EOF
-    ;;
-  cdk)
-    cat <<EOF
-# run from infra/cdk
-npx cdk deploy -c vpcId=${VPC_ID} -c publicSubnetIds=${CSV}
-EOF
-    ;;
-  cfn)
-    cat <<EOF
-[
-  { "ParameterKey": "VpcId", "ParameterValue": "${VPC_ID}" },
-  { "ParameterKey": "PublicSubnetIds", "ParameterValue": "${CSV}" }
-]
 EOF
     ;;
   env)

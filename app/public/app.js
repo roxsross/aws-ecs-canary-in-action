@@ -304,7 +304,7 @@ function renderObserved() {
   const pinnedCount = state.probes.length - sample.length;
   els.observedNote.textContent = sample.length
     ? [
-        `${nf.format(sample.length)} sondas`,
+        `${nf.format(sample.length)} solicitudes de prueba`,
         `${counts.stable} estable / ${counts.canary} canary`,
         errors ? `${errors} con error` : 'sin errores',
         `rtt medio ${avgRtt} ms`,
@@ -313,8 +313,8 @@ function renderObserved() {
         .filter(Boolean)
         .join(' · ')
     : state.paused || state.settings.rate === 0
-      ? 'sondas en pausa'
-      : 'esperando la primera sonda…';
+      ? 'muestreo en pausa'
+      : 'esperando la primera solicitud de prueba…';
 
   if (counts.unknown > 0) {
     els.observedNote.textContent += ` · ${counts.unknown} sin identificar (5xx del ALB)`;
@@ -453,7 +453,7 @@ function renderBarcode() {
   if (!container) return;
   const ticks = state.probes.slice(-BARCODE_TICKS);
   if (!ticks.length) {
-    container.innerHTML = '<p class="barcode-empty">Sin sondas todavía.</p>';
+    container.innerHTML = '<p class="barcode-empty">Sin solicitudes de prueba todavía.</p>';
     return;
   }
   const fragment = document.createDocumentFragment();
@@ -616,7 +616,7 @@ function renderFeed() {
 
   els.feedSource.textContent = useGlobal
     ? 'origen: DynamoDB · todas las tareas'
-    : 'origen: sondas de este navegador';
+    : 'origen: solicitudes de prueba de este navegador';
 
   if (!rows.length) {
     container.innerHTML = '<li class="feed-empty">Sin solicitudes todavía.</li>';
@@ -725,7 +725,7 @@ function setPin(pin) {
   });
   if (pin !== 'auto') {
     toast(
-      `Sondas forzadas a la versión ${pin}. El reparto observado ignora estas solicitudes.`,
+      `Solicitudes de prueba forzadas a la versión ${pin}. La distribución observada ignora estas solicitudes.`,
       'info',
       5000,
     );
@@ -752,7 +752,7 @@ function pushChaos(patch, immediate = false) {
       });
       await loadStats();
     } catch (err) {
-      toast(`No se pudo aplicar el chaos: ${err.message}`, 'error');
+      toast(`No se pudo aplicar la inyección de fallos: ${err.message}`, 'error');
     }
   };
   if (immediate) {
@@ -803,7 +803,7 @@ function wireControls() {
     state.paused = !state.paused;
     const button = event.currentTarget;
     button.setAttribute('aria-pressed', state.paused ? 'false' : 'true');
-    els.probeToggleLabel.textContent = state.paused ? 'Reanudar sondas' : 'Pausar sondas';
+    els.probeToggleLabel.textContent = state.paused ? 'Reanudar muestreo' : 'Pausar muestreo';
     scheduleProbes();
     renderObserved();
   });
@@ -827,7 +827,7 @@ function wireControls() {
     els.latencyOut.textContent = '1200 ms';
     pushChaos({ failRate: 50, latencyMs: 1200 }, true);
     toast(
-      `Rompiendo la versión ${state.settings.chaosTrack}: 50% de 5xx y 1200 ms extra. Las alarmas deberían disparar el rollback.`,
+      `Simulando incidente en la versión ${state.settings.chaosTrack}: 50% de 5xx y 1200 ms extra. Las alarmas deberían disparar el rollback.`,
       'error',
       9000,
     );
@@ -841,10 +841,10 @@ function wireControls() {
       inputs.unhealthy.checked = false;
       els.failOut.textContent = '0%';
       els.latencyOut.textContent = '0 ms';
-      toast('Chaos limpiado en ambas versiones.', 'success', 4000);
+      toast('Inyección de fallos desactivada en ambas versiones.', 'success', 4000);
       await loadStats();
     } catch (err) {
-      toast(`No se pudo limpiar el chaos: ${err.message}`, 'error');
+      toast(`No se pudo desactivar la inyección de fallos: ${err.message}`, 'error');
     }
   });
 

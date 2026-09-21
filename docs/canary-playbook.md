@@ -164,9 +164,9 @@ make status
 
 Abre el dashboard. Señala las tres barras y que la canary está en cero.
 
-**2. Sube el ritmo de sondas (30 s)**
+**2. Sube el ritmo de solicitudes de prueba (30 s)**
 
-Lleva el slider a 15 por segundo. El reparto observado se estabiliza en 100/0.
+Lleva el slider a 15 por segundo. La distribución observada se estabiliza en 100/0.
 
 **3. Mueve el tráfico a mano (2 min)**
 
@@ -178,15 +178,15 @@ La barra del ALB salta al instante; la observada tarda unas peticiones en seguir
 Ahí se explica que **los pesos son probabilidad**. Sube a 25 y 50 y aparece la
 segunda tarjeta con su propia latencia.
 
-**4. Rómpela (3 min)**
+**4. Simula un incidente (3 min)**
 
 ```bash
 ./scripts/chaos.sh --break
 ```
 
-La tira de sondas se llena de rojo solo en las marcas rosas. La tarjeta de la canary
-se pone en rojo; la de la estable sigue limpia. Dos minutos después las alarmas están
-en ALARM.
+La tira de solicitudes de prueba se llena de rojo solo en las marcas rosas. La
+tarjeta de la canary se pone en rojo; la de la estable sigue limpia. Dos minutos
+después las alarmas están en ALARM.
 
 **5. Revierte (1 min)**
 

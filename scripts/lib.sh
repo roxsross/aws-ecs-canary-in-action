@@ -1,10 +1,7 @@
 # shellcheck shell=bash
 # ---------------------------------------------------------------------------
 # Shared helpers for the canary scripts. Sourced, never executed.
-#
-# Every script reads the same CANARY_* contract, produced by load-env.sh from
-# whichever infrastructure flavour you deployed (terraform, cloudformation, cdk).
-#
+# Every script reads the CANARY_* contract written by load-env.sh.
 # Written for bash 3.2 so it runs on a stock macOS shell.
 # ---------------------------------------------------------------------------
 
@@ -91,10 +88,7 @@ require_canary_env() {
   done
   if [ "$missing_count" -gt 0 ]; then
     err "missing environment:${missing_list}"
-    info "generate it once with one of:"
-    info "  ./scripts/load-env.sh terraform"
-    info "  ./scripts/load-env.sh cloudformation --stack canary-lab"
-    info "  ./scripts/load-env.sh cdk --stack canary-lab"
+    info "generate it once with:  ./scripts/load-env.sh"
     exit 1
   fi
 }
@@ -124,7 +118,6 @@ confirm() {
 
 # --------------------------------------------------------- load balancer ----
 
-# Echoes the target groups of the listener's default rule, as JSON.
 alb_default_target_groups() {
   # shellcheck disable=SC2016  # backticks are JMESPath literals
   awsx elbv2 describe-rules \
@@ -133,7 +126,6 @@ alb_default_target_groups() {
     --output json
 }
 
-# Echoes "<stableWeight> <canaryWeight>".
 alb_weights() {
   local json stable canary
   json="$(alb_default_target_groups)" || return 1
@@ -144,7 +136,6 @@ alb_weights() {
   printf '%s %s\n' "$stable" "$canary"
 }
 
-# Echoes the canary share as a percentage of the total weight.
 alb_canary_percent() {
   local pair stable canary total
   pair="$(alb_weights)" || return 1

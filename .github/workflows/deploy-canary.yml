@@ -2,13 +2,11 @@
 # Progressive canary rollout from CI.
 #
 # Setup, once:
-#   1. create the OIDC provider and role:  infra/github-oidc/oidc-role.yaml
-#   2. repository secret   AWS_ROLE_ARN    arn:aws:iam::<account>:role/<role>
+#   1. terraform apply the stack, with a remote backend so CI can read its state
+#   2. repository secret   AWS_ROLE_ARN    an IAM role CI can assume via OIDC
 #   3. repository variables
 #        AWS_REGION    us-east-1
 #        PROJECT_NAME  canary-lab
-#        IAC_FLAVOUR   terraform | cloudformation | cdk
-#        STACK_NAME    canary-lab            (CloudFormation / CDK only)
 #   4. optional: a "production" environment with required reviewers, which turns
 #      the promote job into a manual approval gate
 #
@@ -56,8 +54,6 @@ concurrency:
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
   PROJECT_NAME: ${{ vars.PROJECT_NAME || 'canary-lab' }}
-  IAC_FLAVOUR: ${{ vars.IAC_FLAVOUR || 'terraform' }}
-  STACK_NAME: ${{ vars.STACK_NAME || 'canary-lab' }}
 
 jobs:
   build:
@@ -112,22 +108,14 @@ jobs:
           role-session-name: canary-rollout-${{ github.run_id }}
 
       - uses: hashicorp/setup-terraform@v4
-        if: env.IAC_FLAVOUR == 'terraform'
         with:
-          terraform_version: 1.11.2
+          terraform_version: 1.16.3
           terraform_wrapper: false
 
       - name: Load the deployment environment
         run: |
-          if [ "${IAC_FLAVOUR}" = "terraform" ]; then
-            # Terraform needs its state to read the outputs. With a remote backend
-            # this just works; with local state, use the cloudformation or cdk
-            # flavour from CI instead, since the outputs live in the stack.
-            terraform -chdir=infra/terraform init -input=false
-          fi
-          ./scripts/load-env.sh "${IAC_FLAVOUR}" \
-            --stack "${STACK_NAME}" \
-            --region "${AWS_REGION}"
+          terraform -chdir=infra/terraform init -input=false
+          ./scripts/load-env.sh --region "${AWS_REGION}"
 
       - name: State before the rollout
         run: |
@@ -195,19 +183,14 @@ jobs:
           role-session-name: canary-promote-${{ github.run_id }}
 
       - uses: hashicorp/setup-terraform@v4
-        if: env.IAC_FLAVOUR == 'terraform'
         with:
-          terraform_version: 1.11.2
+          terraform_version: 1.16.3
           terraform_wrapper: false
 
       - name: Load the deployment environment
         run: |
-          if [ "${IAC_FLAVOUR}" = "terraform" ]; then
-            terraform -chdir=infra/terraform init -input=false
-          fi
-          ./scripts/load-env.sh "${IAC_FLAVOUR}" \
-            --stack "${STACK_NAME}" \
-            --region "${AWS_REGION}"
+          terraform -chdir=infra/terraform init -input=false
+          ./scripts/load-env.sh --region "${AWS_REGION}"
 
       - name: Promote
         run: ./scripts/promote.sh --image "${{ needs.build.outputs.image }}" --yes

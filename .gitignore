@@ -21,17 +21,6 @@ terraform.rc
 terraform.tfvars
 !terraform.tfvars.example
 
-# ---- cdk ----
-infra/cdk/cdk.out/
-infra/cdk/*.d.ts
-infra/cdk/*.js
-!infra/cdk/jest.config.js
-infra/cdk/dist/
-
-# ---- cloudformation ----
-infra/cloudformation/params.json
-infra/cloudformation/packaged-*.yaml
-
 # ---- generated env contract (created by scripts/load-env.sh) ----
 .canary.env
 .canary.env.*

@@ -32,8 +32,6 @@ concurrency:
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
   PROJECT_NAME: ${{ vars.PROJECT_NAME || 'canary-lab' }}
-  IAC_FLAVOUR: ${{ vars.IAC_FLAVOUR || 'terraform' }}
-  STACK_NAME: ${{ vars.STACK_NAME || 'canary-lab' }}
 
 jobs:
   rollback:
@@ -52,19 +50,14 @@ jobs:
           role-session-name: canary-rollback-${{ github.run_id }}
 
       - uses: hashicorp/setup-terraform@v4
-        if: env.IAC_FLAVOUR == 'terraform'
         with:
-          terraform_version: 1.11.2
+          terraform_version: 1.16.3
           terraform_wrapper: false
 
       - name: Load the deployment environment
         run: |
-          if [ "${IAC_FLAVOUR}" = "terraform" ]; then
-            terraform -chdir=infra/terraform init -input=false
-          fi
-          ./scripts/load-env.sh "${IAC_FLAVOUR}" \
-            --stack "${STACK_NAME}" \
-            --region "${AWS_REGION}"
+          terraform -chdir=infra/terraform init -input=false
+          ./scripts/load-env.sh --region "${AWS_REGION}"
 
       - name: State before
         run: |

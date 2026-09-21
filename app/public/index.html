@@ -66,7 +66,7 @@
       <div class="topbar-actions">
         <button type="button" class="btn btn-ghost" data-action="toggle-probes" aria-pressed="true">
           <span class="live-dot" aria-hidden="true"></span>
-          <span data-bind="probeToggleLabel">Pausar sondas</span>
+          <span data-bind="probeToggleLabel">Pausar muestreo</span>
         </button>
         <button type="button" class="btn btn-ghost" data-action="reset">Reiniciar contadores</button>
       </div>
@@ -83,13 +83,13 @@
         <div class="split-grid">
           <article class="split-row" data-source="alb">
             <header>
-              <h3>Peso configurado en el ALB</h3>
-              <p class="hint">La intención del despliegue (listener rule)</p>
+              <h3>Distribución configurada (ALB)</h3>
+              <p class="hint">La intención del despliegue (regla del listener)</p>
             </header>
             <div
               class="bar"
               role="img"
-              aria-label="Peso configurado en el balanceador"
+              aria-label="Distribución configurada en el balanceador"
               data-bind="albBar"
             >
               <span class="bar-seg" data-track="stable" style="width: 100%">
@@ -104,13 +104,13 @@
 
           <article class="split-row" data-source="observed">
             <header>
-              <h3>Observado por tu navegador</h3>
-              <p class="hint">Sondas reales a <code>/api/hit</code> desde esta pestaña</p>
+              <h3>Distribución observada (cliente)</h3>
+              <p class="hint">Solicitudes de prueba a <code>/api/hit</code> desde esta pestaña</p>
             </header>
             <div
               class="bar"
               role="img"
-              aria-label="Reparto observado por este navegador"
+              aria-label="Distribución observada por este navegador"
               data-bind="observedBar"
             >
               <span class="bar-seg" data-track="stable" style="width: 100%">
@@ -120,18 +120,18 @@
                 <span class="bar-label"><b data-bind="observedCanary">0%</b> canary</span>
               </span>
             </div>
-            <p class="row-note mono muted" data-bind="observedNote">0 sondas</p>
+            <p class="row-note mono muted" data-bind="observedNote">0 solicitudes de prueba</p>
           </article>
 
           <article class="split-row" data-source="global">
             <header>
-              <h3>Global (todas las tareas)</h3>
+              <h3>Distribución global (todas las tareas)</h3>
               <p class="hint">Contadores compartidos en DynamoDB</p>
             </header>
             <div
               class="bar"
               role="img"
-              aria-label="Reparto global registrado en DynamoDB"
+              aria-label="Distribución global registrada en DynamoDB"
               data-bind="globalBar"
             >
               <span class="bar-seg" data-track="stable" style="width: 100%">
@@ -147,7 +147,7 @@
 
         <div class="barcode-wrap">
           <div class="barcode-head">
-            <h3>Últimas sondas</h3>
+            <h3>Últimas solicitudes de prueba</h3>
             <p class="hint">
               Cada marca es una solicitud: color por versión, rojo si respondió 5xx
             </p>
@@ -275,26 +275,26 @@
 
         <section class="panel panel-controls" aria-labelledby="controls-title">
           <div class="panel-head">
-            <h2 id="controls-title">Sala de control</h2>
-            <p class="panel-sub">Genera tráfico y rompe la canary a propósito</p>
+            <h2 id="controls-title">Controles de despliegue</h2>
+            <p class="panel-sub">Genera tráfico de prueba e inyecta fallos de forma controlada</p>
           </div>
 
           <div class="control-block">
             <label class="control-label" for="rate">
-              Sondas por segundo
+              Solicitudes de prueba por segundo
               <output class="mono" data-bind="rateOut" for="rate">4</output>
             </label>
             <input id="rate" type="range" min="0" max="25" step="1" value="4" />
             <p class="hint">
-              Sube el ritmo para que el reparto converja al peso configurado en el ALB.
+              Sube el ritmo para que la distribución observada converja a la configurada en el ALB.
             </p>
           </div>
 
           <div class="control-block">
-            <span class="control-label" id="pin-label">Enviar sondas a</span>
+            <span class="control-label" id="pin-label">Enviar solicitudes de prueba a</span>
             <div class="segmented" role="radiogroup" aria-labelledby="pin-label">
               <button type="button" role="radio" aria-checked="true" data-pin="auto">
-                Reparto del ALB
+                Distribución del ALB
               </button>
               <button type="button" role="radio" aria-checked="false" data-pin="stable">
                 Solo estable
@@ -341,10 +341,10 @@
 
             <div class="control-actions">
               <button type="button" class="btn btn-danger" data-action="break-canary">
-                Romper la canary
+                Simular incidente
               </button>
               <button type="button" class="btn btn-ghost" data-action="clear-chaos">
-                Limpiar chaos
+                Desactivar inyección de fallos
               </button>
             </div>
             <p class="hint">

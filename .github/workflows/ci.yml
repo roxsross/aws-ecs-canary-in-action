@@ -5,9 +5,6 @@
 # credentials. The integration job brings up the local stack (mini-alb + two app
 # versions + dynamodb-local), shifts the weights and asserts the split actually
 # moved, which is the behaviour the whole repo is about.
-#
-# Actions are pinned to major tags for readability. For a production repo, pin to
-# full commit SHAs instead.
 # ---------------------------------------------------------------------------
 name: CI
 
@@ -17,7 +14,6 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Read only by default: nothing in this workflow needs to write.
 permissions:
   contents: read
 
@@ -31,14 +27,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: |
-            app/package-lock.json
-            infra/cdk/package-lock.json
 
       - name: Check JavaScript syntax
         run: |
@@ -57,12 +45,12 @@ jobs:
           while IFS= read -r file; do
             bash -n "$file" || fail=1
             shellcheck -x "$file" || fail=1
-          done < <(find scripts infra -name '*.sh' -type f -not -path '*/node_modules/*' | sort)
+          done < <(find scripts -name '*.sh' -type f | sort)
           exit $fail
 
       - uses: hashicorp/setup-terraform@v4
         with:
-          terraform_version: 1.11.2
+          terraform_version: 1.16.3
           terraform_wrapper: false
 
       - name: Terraform fmt and validate
@@ -72,24 +60,17 @@ jobs:
           terraform init -backend=false -input=false
           terraform validate
 
-      - name: Install cfn-lint
-        run: pipx install cfn-lint
-
-      # cfn-lint checks the template offline; `aws cloudformation validate-template`
-      # would need credentials, which pull requests deliberately do not have.
-      - name: Lint the CloudFormation template
-        run: cfn-lint infra/cloudformation/canary-stack.yaml
-
-      - name: CDK type check and synth
-        working-directory: infra/cdk
-        run: |
-          npm ci
-          npx tsc --noEmit
-          npx cdk synth \
-            -c vpcId=vpc-0123456789abcdef0 \
-            -c publicSubnetIds=subnet-0aaaaaaaaaaaaaaaa,subnet-0bbbbbbbbbbbbbbbb \
-            > /dev/null
-          echo "cdk synth ok"
+      # tfsec's successor: same team, same rule engine, actively maintained.
+      # Accepted lab tradeoffs (public ALB, HTTP only, open egress, ADMIN_TOKEN
+      # as a plain env var, mutable ECR tags) are suppressed inline in the .tf
+      # files with #trivy:ignore comments and a reason each.
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          scan-type: config
+          scan-ref: infra/terraform
+          severity: HIGH,CRITICAL
+          exit-code: "1"
 
   container:
     name: Container smoke test

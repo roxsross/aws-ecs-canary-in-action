@@ -13,8 +13,6 @@ SHELL := /bin/bash
 PROJECT      ?= canary-lab
 TAG          ?= v1
 REGION       ?= $(or $(AWS_REGION),us-east-1)
-STACK        ?= $(PROJECT)
-FLAVOUR      ?= terraform
 STEPS        ?= 5,25,50,100
 BAKE         ?= 90
 CANARY_TASKS ?= 1
@@ -23,8 +21,6 @@ DURATION     ?= 60
 
 SCRIPTS   := ./scripts
 TF_DIR    := infra/terraform
-CFN_DIR   := infra/cloudformation
-CDK_DIR   := infra/cdk
 LOCAL_DIR := local
 
 CYAN  := \033[36m
@@ -35,11 +31,11 @@ RESET := \033[0m
 .PHONY: help
 help: ## Show this help
 	@printf '\n$(BOLD)ECS Canary in Action$(RESET)\n'
-	@printf '$(DIM)canary deployments on ECS Fargate, in an existing VPC$(RESET)\n\n'
+	@printf '$(DIM)canary deployments on ECS Fargate$(RESET)\n\n'
 	@awk 'BEGIN { FS = ":.*##" } \
 		/^[a-zA-Z0-9_.-]+:.*##/ { printf "  $(CYAN)%-22s$(RESET) %s\n", $$1, $$2 } \
 		/^##@/ { printf "\n$(BOLD)%s$(RESET)\n", substr($$0, 5) }' $(MAKEFILE_LIST)
-	@printf '\n$(DIM)variables: PROJECT=$(PROJECT) TAG=$(TAG) REGION=$(REGION) FLAVOUR=$(FLAVOUR)$(RESET)\n\n'
+	@printf '\n$(DIM)variables: PROJECT=$(PROJECT) TAG=$(TAG) REGION=$(REGION)$(RESET)\n\n'
 
 ##@ Local, no AWS account needed
 
@@ -78,10 +74,10 @@ ecr: push ## Alias for push
 push: ## Build and push the image (make push TAG=v2)
 	$(SCRIPTS)/build-push.sh --tag $(TAG) --project $(PROJECT) --region $(REGION)
 
-##@ Infrastructure (pick one flavour)
+##@ Infrastructure (Terraform)
 
 .PHONY: vpc
-vpc: ## List existing VPCs and subnets you could use
+vpc: ## List existing VPCs and subnets you could reuse
 	$(SCRIPTS)/discover-vpc.sh --region $(REGION)
 
 .PHONY: tf-init tf-plan tf-apply tf-destroy
@@ -93,33 +89,14 @@ tf-plan: ## terraform plan
 
 tf-apply: ## terraform apply, then load the script environment
 	terraform -chdir=$(TF_DIR) apply
-	$(MAKE) env FLAVOUR=terraform
+	$(MAKE) env
 
 tf-destroy: ## terraform destroy
 	terraform -chdir=$(TF_DIR) destroy
 
-.PHONY: cfn-deploy cfn-destroy
-cfn-deploy: ## Deploy the CloudFormation stack, then load the environment
-	$(CFN_DIR)/deploy.sh --stack-name $(STACK) --region $(REGION) --keep-weights
-	$(MAKE) env FLAVOUR=cloudformation
-
-cfn-destroy: ## Delete the CloudFormation stack
-	$(CFN_DIR)/deploy.sh --stack-name $(STACK) --region $(REGION) --delete
-
-.PHONY: cdk-deploy cdk-destroy cdk-synth
-cdk-synth: ## cdk synth (no credentials needed)
-	cd $(CDK_DIR) && npm install --silent && npx cdk synth
-
-cdk-deploy: ## Deploy with CDK, then load the environment
-	cd $(CDK_DIR) && npm install --silent && npx cdk deploy --require-approval never
-	$(MAKE) env FLAVOUR=cdk
-
-cdk-destroy: ## Destroy the CDK stack
-	cd $(CDK_DIR) && npx cdk destroy
-
 .PHONY: env
-env: ## Regenerate .canary.env from the deployed stack
-	$(SCRIPTS)/load-env.sh $(FLAVOUR) --stack $(STACK) --region $(REGION)
+env: ## Regenerate .canary.env from terraform output
+	$(SCRIPTS)/load-env.sh --region $(REGION)
 
 ##@ Canary flow
 
@@ -154,7 +131,7 @@ traffic: ## Generate traffic and report the observed split
 	$(SCRIPTS)/traffic-gen.sh --rps $(RPS) --duration $(DURATION)
 
 .PHONY: break fix chaos-show
-break: ## Break the canary on purpose (50% 5xx + 1200ms)
+break: ## Inject a fault into the canary on purpose (50% 5xx + 1200ms)
 	$(SCRIPTS)/chaos.sh --break
 
 fix: ## Remove every injected fault
@@ -173,10 +150,9 @@ demo-rollout: ## Happy path: push TAG, roll it out, promote
 	$(MAKE) status
 
 .PHONY: demo-rollback
-demo-rollback: ## Failure path: break the canary and watch it roll itself back
+demo-rollback: ## Failure path: inject a fault and watch it roll itself back
 	@printf '\n$(BOLD)Failure path$(RESET) $(DIM)the canary misbehaves, alarms fire, traffic goes back$(RESET)\n\n'
-	@printf '  1. run this in another terminal:  make watch\n'
-	@printf '  2. this will start a rollout and break it on purpose\n\n'
+	@printf '  1. run this in another terminal:  make watch\n\n'
 	$(SCRIPTS)/weights.sh --canary 25
 	$(SCRIPTS)/chaos.sh --break
 	@printf '\n  waiting 90s for the alarms to notice...\n\n'
@@ -188,12 +164,12 @@ demo-rollback: ## Failure path: break the canary and watch it roll itself back
 ##@ Checks
 
 .PHONY: lint
-lint: lint-js lint-sh lint-tf lint-cfn lint-cdk ## Run every static check
+lint: lint-js lint-sh lint-tf lint-trivy ## Run every static check
 
 .PHONY: lint-sh
 lint-sh: ## shellcheck + bash syntax on every script
 	@fail=0; \
-	files=$$(find scripts infra -name '*.sh' -type f -not -path '*/node_modules/*' | sort); \
+	files=$$(find scripts -name '*.sh' -type f | sort); \
 	for f in $$files; do \
 		bash -n "$$f" || fail=1; \
 		if command -v shellcheck >/dev/null 2>&1; then \
@@ -211,22 +187,6 @@ lint-tf: ## terraform fmt + validate
 	terraform -chdir=$(TF_DIR) init -backend=false -input=false >/dev/null
 	terraform -chdir=$(TF_DIR) validate
 
-.PHONY: lint-cfn
-lint-cfn: ## Validate the CloudFormation template
-	aws cloudformation validate-template \
-		--template-body file://$(CFN_DIR)/canary-stack.yaml \
-		--region $(REGION) --query Description --output text
-
-.PHONY: lint-cdk
-lint-cdk: ## Type check and synth the CDK app
-	# Placeholder network values: this is a syntax and synth check, not a deployment.
-	cd $(CDK_DIR) && npm install --silent && npx tsc --noEmit && \
-		npx cdk synth \
-			-c vpcId=vpc-0123456789abcdef0 \
-			-c publicSubnetIds=subnet-0aaaaaaaaaaaaaaaa,subnet-0bbbbbbbbbbbbbbbb \
-			>/dev/null
-	@printf '  cdk synth ok\n'
-
 .PHONY: lint-js
 lint-js: ## Syntax check the Node sources
 	@for f in $$(find app local -name '*.js' -not -path '*/node_modules/*' | sort); do \
@@ -234,10 +194,19 @@ lint-js: ## Syntax check the Node sources
 	done; \
 	printf '  javascript ok\n'
 
+.PHONY: lint-trivy
+lint-trivy: ## Security scan the Terraform stack with Trivy (tfsec's successor)
+	@command -v trivy >/dev/null 2>&1 || { \
+		printf '  trivy not installed. brew install trivy\n'; \
+		exit 1; \
+	}
+	trivy config --severity HIGH,CRITICAL --exit-code 1 $(TF_DIR)
+	@printf '  trivy: no HIGH/CRITICAL findings\n'
+
 ##@ Cleanup
 
 .PHONY: clean
 clean: ## Remove local build artefacts and the generated environment file
-	rm -rf $(CDK_DIR)/cdk.out .canary.env
+	rm -f .canary.env
 	find . -name '*.tfplan' -delete
 	@printf '  cleaned\n'

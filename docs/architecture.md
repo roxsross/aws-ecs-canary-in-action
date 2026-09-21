@@ -71,7 +71,7 @@ navegador
               sí -> target group indicado
               no  -> sorteo por pesos
                       └─> tarea Fargate (:8080)
-                            ├─ aplica chaos: latencia y/o 500
+                            ├─ aplica la falla inyectada: latencia y/o 500
                             ├─ escribe el hit en DynamoDB (async)
                             ├─ suma al buffer EMF
                             └─ responde con X-Track, X-Version, X-Task-Id
@@ -92,9 +92,9 @@ Node 22 con Express, sin build step y sin dependencias de frontend.
 | Ruta | Para qué |
 |---|---|
 | `GET /` | dashboard |
-| `GET /api/health` | health check del target group. Devuelve 503 si hay chaos `unhealthy` o si la tarea está drenando |
-| `GET /api/hit` | la petición que se mide. Aplica el chaos, registra y responde quién atendió |
-| `GET /api/stats` | vista global: contadores, serie por minuto, últimas peticiones, chaos, pesos |
+| `GET /api/health` | health check del target group. Devuelve 503 si hay una falla `unhealthy` inyectada o si la tarea está drenando |
+| `GET /api/hit` | la petición que se mide. Aplica la inyección de fallos activa, registra y responde quién atendió |
+| `GET /api/stats` | vista global: contadores, serie por minuto, últimas peticiones, estado de inyección de fallos, pesos |
 | `GET /api/config` | bootstrap del dashboard: paleta, identidad, capacidades |
 | `GET /api/whoami` | identidad detallada de la tarea |
 | `GET /api/weights` | pesos reales leídos del listener |
@@ -243,7 +243,7 @@ mirar, no para disparar un rollback.
 
 ## 6. Seguridad y permisos
 
-### Red: creada o referenciada (solo Terraform)
+### Red: creada o referenciada
 
 `infra/terraform/vpc.tf` decide con un único interruptor, `var.vpc_id`:
 
@@ -257,8 +257,6 @@ vpc_id con un valor         -> data "aws_vpc" y data "aws_subnet" referencian
 
 El resto del stack no sabe ni le importa cuál de los dos caminos se tomó: todo
 lee `local.vpc_id` y `local.public_subnet_ids`, resueltos en ese mismo archivo.
-CloudFormation y CDK todavía no tienen este modo: siempre esperan una VPC
-existente, la que se pasa por parámetro o contexto.
 
 La VPC creada es deliberadamente mínima (sin NAT, sin subnets privadas), así
 que las tareas necesitan IP pública para bajar la imagen; por eso
@@ -302,8 +300,8 @@ El URI de la imagen se **compone**, nunca se busca:
 <account>.dkr.ecr.<region>.amazonaws.com/<proyecto>-app:<tag>
 ```
 
-Por eso `terraform plan`, `cdk synth` y la validación de CloudFormation funcionan
-en una cuenta limpia, sin que la imagen exista todavía.
+Por eso `terraform plan` funciona en una cuenta limpia, sin que la imagen exista
+todavía.
 
 El orden recomendado es **registro, luego infraestructura**, porque un servicio de
 ECS no arranca sin algo que correr:
@@ -313,9 +311,9 @@ build-push.sh --tag v1     crea el repositorio si falta y sube la imagen
 terraform apply            crea el resto y las tareas arrancan sanas de primera
 ```
 
-Si prefieres que la IaC sea dueña del repositorio, pon `create_ecr_repository = true`
-(o `CreateEcrRepository=true`, o `-c createEcrRepository=true`). El URI se calcula
-igual, así que no aparece ninguna dependencia circular.
+Si prefieres que Terraform sea dueño del repositorio, pon
+`create_ecr_repository = true`. El URI se calcula igual, así que no aparece
+ninguna dependencia circular.
 
 **Arquitectura del binario.** Fargate espera por defecto `X86_64`. Como mucha gente
 construye en Apple silicon, `build-push.sh` fuerza `--platform linux/amd64`. Si
@@ -343,10 +341,10 @@ sea el mismo.
 
 ---
 
-## 9. El contrato entre IaC y scripts
+## 9. El contrato entre Terraform y los scripts
 
-Los tres sabores exponen las mismas salidas, y `scripts/load-env.sh` las traduce a
-un único conjunto de variables:
+Terraform expone una única salida, `canary_env`, con todo lo que los scripts
+necesitan:
 
 ```
 CANARY_REGION           CANARY_TG_STABLE        CANARY_ALARM_5XX
@@ -359,9 +357,7 @@ CANARY_TABLE            CANARY_LOG_GROUP        CANARY_CONTAINER_NAME
                                                 CANARY_CONTAINER_PORT
 ```
 
-Terraform los entrega en la salida `canary_env`; CloudFormation y CDK como salidas
-individuales en CamelCase (CloudFormation no admite guiones bajos en los IDs
-lógicos), y el script las mapea con una tabla explícita.
-
-Esa indirección es la razón de que `canary-deploy.sh`, `rollback.sh` y `status.sh`
-no sepan ni les importe con qué herramienta desplegaste.
+`scripts/load-env.sh` la vuelca a `.canary.env`, que el resto de los scripts
+sourcea. Esa indirección es la razón de que `canary-deploy.sh`, `rollback.sh`
+y `status.sh` no necesiten saber nada de Terraform: solo leen variables de
+entorno.

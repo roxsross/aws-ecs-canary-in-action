@@ -40,7 +40,7 @@ env:
   PROJECT_NAME: ${{ vars.PROJECT_NAME || 'canary-lab' }}
   TF_IN_AUTOMATION: "true"
   TF_INPUT: "false"
-  TERRAFORM_VERSION: 1.11.2
+  TERRAFORM_VERSION: 1.16.3
 
 jobs:
   validate:
@@ -51,7 +51,7 @@ jobs:
 
       - uses: hashicorp/setup-terraform@v4
         with:
-          terraform_version: 1.11.2
+          terraform_version: 1.16.3
           terraform_wrapper: false
 
       # No credentials needed, so this also runs on forks.
@@ -87,7 +87,7 @@ jobs:
       - uses: hashicorp/setup-terraform@v4
         if: steps.creds.outputs.available == 'true'
         with:
-          terraform_version: 1.11.2
+          terraform_version: 1.16.3
           terraform_wrapper: false
 
       - uses: aws-actions/configure-aws-credentials@v6
@@ -105,7 +105,8 @@ jobs:
           TF_PUBLIC_SUBNET_IDS: ${{ vars.TF_PUBLIC_SUBNET_IDS }}
         run: |
           if [ -z "${TF_VPC_ID}" ] || [ -z "${TF_PUBLIC_SUBNET_IDS}" ]; then
-            echo "set the TF_VPC_ID and TF_PUBLIC_SUBNET_IDS repository variables" >&2
+            echo "set the TF_VPC_ID and TF_PUBLIC_SUBNET_IDS repository variables (or leave them" >&2
+            echo "unset and drop -var vpc_id/-var public_subnet_ids below to let Terraform create a VPC)" >&2
             echo "find them with: ./scripts/discover-vpc.sh --format tfvars" >&2
             exit 1
           fi
@@ -165,7 +166,7 @@ jobs:
 
       - uses: hashicorp/setup-terraform@v4
         with:
-          terraform_version: 1.11.2
+          terraform_version: 1.16.3
           terraform_wrapper: false
 
       - uses: aws-actions/configure-aws-credentials@v6
@@ -199,6 +200,6 @@ jobs:
             echo ""
             echo "Load the script environment locally with:"
             echo '```bash'
-            echo "./scripts/load-env.sh terraform"
+            echo "./scripts/load-env.sh"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
