@@ -1,24 +1,22 @@
 # ---------------------------------------------------------------------------
-# The break glass workflow: send every request back to the stable track.
+# The break glass workflow: redeploy the previous task definition revision.
 #
-# Traffic rollback is instant because it only rewrites the listener weights, so
-# this is safe to run at any time, including while a rollout is in progress.
+# With ECS's native canary strategy, a rollout already in progress is watched
+# by ECS itself (deployment_configuration.alarms in infra/terraform/ecs.tf)
+# and rolls back on its own if an alarm fires. This workflow is for cutting a
+# healthy-looking rollout short on purpose, or for reverting a revision that
+# already reached COMPLETED and is serving 100% of traffic.
 # ---------------------------------------------------------------------------
 name: Rollback
 
 on:
   workflow_dispatch:
     inputs:
-      revert_task_definition:
-        description: "Also roll the stable service back one revision"
+      to_task_definition:
+        description: "family:revision or ARN to roll back to (leave empty for the previous one)"
         required: false
-        default: false
-        type: boolean
-      keep_canary:
-        description: "Leave the canary tasks running for a post mortem"
-        required: false
-        default: false
-        type: boolean
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -35,7 +33,7 @@ env:
 
 jobs:
   rollback:
-    name: Traffic back to stable
+    name: Redeploy the previous revision
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -64,18 +62,15 @@ jobs:
           {
             echo "### Before"
             echo '```json'
-            ./scripts/status.sh --json | jq '{split, services, alarmsFiring}'
+            ./scripts/status.sh --json | jq '{service, alarmsFiring}'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Roll back
         run: |
           args="--yes"
-          if [ "${{ inputs.revert_task_definition }}" = "true" ]; then
-            args="$args --previous"
-          fi
-          if [ "${{ inputs.keep_canary }}" = "true" ]; then
-            args="$args --keep-canary"
+          if [ -n "${{ inputs.to_task_definition }}" ]; then
+            args="$args --to ${{ inputs.to_task_definition }}"
           fi
           # shellcheck disable=SC2086
           ./scripts/rollback.sh $args
@@ -86,6 +81,6 @@ jobs:
           {
             echo "### After"
             echo '```json'
-            ./scripts/status.sh --json | jq '{split, services, targets}'
+            ./scripts/status.sh --json | jq '{service, targets, alarmsFiring}'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# Emergency exit. Sends every request back to the stable track.
+# Emergency exit: send the service back to the last known good revision.
 #
-#   ./scripts/rollback.sh                 # traffic only: fastest, no deployment
-#   ./scripts/rollback.sh --previous      # also roll stable back one revision
-#   ./scripts/rollback.sh --to canary-lab-stable:7
+#   ./scripts/rollback.sh                 # revert to the previous task definition
+#   ./scripts/rollback.sh --to canary-lab-app:7
 #
-# Traffic rollback is instant because it only rewrites the listener weights: no
-# image pull, no task start, no waiting. Rolling the task definition back is the
-# second step, for when the bad version already reached the stable service.
+# With ECS's native canary strategy there is no "traffic weight" to reset by
+# hand: if a rollout is IN_PROGRESS, ECS is already watching the alarms below
+# and will roll itself back the moment one fires. This script is for the two
+# cases that need a human:
+#   - you want to cut a healthy-looking rollout short, on your own judgement
+#   - a bad revision already reached COMPLETED and is serving 100% of traffic
+# Either way, it redeploys the previous task definition through the same
+# canary strategy, so even the rollback itself ramps up gradually and can be
+# watched.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -18,16 +23,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${SCRIPT_DIR}/lib.sh"
 
 REVERT_TASKDEF=""
-USE_PREVIOUS=false
-KEEP_CANARY=false
+POLL=15
+TIMEOUT=1800
 
 usage() {
   print_header_help "${BASH_SOURCE[0]}"
   cat <<'EOF'
 Options
-  --previous        Roll the stable service back to the previous revision
-  --to TASKDEF      Roll the stable service back to this family:revision or ARN
-  --keep-canary     Leave the canary tasks running (for a post mortem)
+  --to TASKDEF      Roll back to this family:revision or ARN (default: previous revision)
+  --poll SECONDS     Rollout status poll interval (default: 15)
+  --timeout SECONDS  Give up waiting after this long (default: 1800)
   --yes             Do not ask for confirmation
   --region REGION   AWS region
   -h, --help        This help
@@ -36,9 +41,9 @@ EOF
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --previous) USE_PREVIOUS=true; shift ;;
     --to) REVERT_TASKDEF="$2"; shift 2 ;;
-    --keep-canary) KEEP_CANARY=true; shift ;;
+    --poll) POLL="$2"; shift 2 ;;
+    --timeout) TIMEOUT="$2"; shift 2 ;;
     --yes | -y) export CANARY_ASSUME_YES=true; shift ;;
     --region) export AWS_REGION="$2"; shift 2 ;;
     -h | --help) usage; exit 0 ;;
@@ -47,52 +52,25 @@ while [ $# -gt 0 ]; do
 done
 
 require_tools aws jq
-require_canary_env \
-  CANARY_CLUSTER CANARY_LISTENER_ARN CANARY_TG_STABLE CANARY_TG_CANARY \
-  CANARY_SVC_STABLE CANARY_SVC_CANARY CANARY_TASKDEF_STABLE
+require_canary_env CANARY_CLUSTER CANARY_SERVICE CANARY_TASKDEF_FAMILY
 
-BEFORE="$(alb_weights)"
 step "current state"
-info "split      stable=${BEFORE%% *} canary=${BEFORE##* }"
-info "stable     $(ecs_current_image "$CANARY_SVC_STABLE" 2>/dev/null || printf 'unknown')"
-info "canary     $(ecs_desired_count "$CANARY_SVC_CANARY") task(s) desired"
+CURRENT_TASKDEF="$(ecs_task_definition)"
+CURRENT_STATE="$(ecs_rollout_state)"
+info "image         $(ecs_current_image 2>/dev/null || printf 'unknown')"
+info "task def      ${CURRENT_TASKDEF##*/}"
+info "rollout state ${CURRENT_STATE}"
 
-if [ "${BEFORE##* }" = "0" ] && [ "$USE_PREVIOUS" != true ] && [ -z "$REVERT_TASKDEF" ]; then
-  ok "the canary already receives no traffic, nothing to roll back"
-  if [ "$(ecs_desired_count "$CANARY_SVC_CANARY")" != "0" ] && [ "$KEEP_CANARY" != true ]; then
-    step "scaling the idle canary to zero"
-    ecs_scale "$CANARY_SVC_CANARY" 0
-    ok "done"
-  fi
-  exit 0
+if [ "$CURRENT_STATE" = "IN_PROGRESS" ]; then
+  warn "a rollout is in progress. ECS is already watching the alarms and will roll"
+  warn "itself back automatically if one fires. Continuing will instead redeploy the"
+  warn "revision below over whatever is running now."
 fi
 
-# ---------------------------------------------------------- traffic rollback --
-
-step "sending all traffic to stable"
-alb_set_weights 100 0
-ok "listener is 100% stable"
-print_split_bar 100 0
-
-if [ "$KEEP_CANARY" != true ]; then
-  step "scaling the canary to zero"
-  ecs_scale "$CANARY_SVC_CANARY" 0
-  ok "canary service scaled to 0"
-else
-  warn "canary tasks left running on purpose (--keep-canary)"
-  info "they take no traffic, but you can still reach them:"
-  info "  curl -s '$(app_url)/api/whoami?track=canary' | jq"
-fi
-
-# -------------------------------------------------- task definition rollback --
-
-if [ "$USE_PREVIOUS" = true ] && [ -z "$REVERT_TASKDEF" ]; then
-  step "looking for the previous revision of ${CANARY_TASKDEF_STABLE}"
-  CURRENT_TASKDEF="$(ecs_task_definition "$CANARY_SVC_STABLE")"
-  CURRENT_REVISION="${CURRENT_TASKDEF##*:}"
-
+if [ -z "$REVERT_TASKDEF" ]; then
+  step "looking for the previous revision of ${CANARY_TASKDEF_FAMILY}"
   REVISIONS="$(awsx ecs list-task-definitions \
-    --family-prefix "$CANARY_TASKDEF_STABLE" \
+    --family-prefix "$CANARY_TASKDEF_FAMILY" \
     --status ACTIVE \
     --sort DESC \
     --query 'taskDefinitionArns' \
@@ -102,29 +80,32 @@ if [ "$USE_PREVIOUS" = true ] && [ -z "$REVERT_TASKDEF" ]; then
     map(select(. != $current)) | first // ""
   ')"
 
-  if [ -z "$REVERT_TASKDEF" ]; then
-    warn "no earlier revision of ${CANARY_TASKDEF_STABLE} exists, leaving revision ${CURRENT_REVISION} in place"
-  else
-    info "current  revision ${CURRENT_REVISION}"
-    info "reverting to ${REVERT_TASKDEF##*/}"
-  fi
+  [ -n "$REVERT_TASKDEF" ] || die "no earlier revision of ${CANARY_TASKDEF_FAMILY} exists"
 fi
 
-if [ -n "$REVERT_TASKDEF" ]; then
-  REVERT_IMAGE="$(awsx ecs describe-task-definition --task-definition "$REVERT_TASKDEF" \
-    --query "taskDefinition.containerDefinitions[?name=='${CANARY_CONTAINER_NAME:-app}'].image | [0]" \
-    --output text 2>/dev/null || printf 'unknown')"
-  warn "this redeploys the stable service with image ${REVERT_IMAGE}"
-  if confirm "roll the stable service back to ${REVERT_TASKDEF##*/}?"; then
-    ecs_set_task_definition "$CANARY_SVC_STABLE" "$REVERT_TASKDEF"
-    ecs_wait_stable "$CANARY_SVC_STABLE" || warn "the stable service is still settling; check ./scripts/status.sh"
-    ok "stable service is back on ${REVERT_TASKDEF##*/}"
-  else
-    info "skipped the task definition rollback; traffic is still 100% stable"
-  fi
+REVERT_IMAGE="$(awsx ecs describe-task-definition --task-definition "$REVERT_TASKDEF" \
+  --query "taskDefinition.containerDefinitions[?name=='${CANARY_CONTAINER_NAME:-app}'].image | [0]" \
+  --output text 2>/dev/null || printf 'unknown')"
+
+info "reverting to  ${REVERT_TASKDEF##*/}"
+info "image         ${REVERT_IMAGE}"
+confirm "roll ${CANARY_SERVICE} back to ${REVERT_TASKDEF##*/}?" || die "aborted"
+
+step "redeploying ${REVERT_TASKDEF##*/}"
+awsx ecs update-service \
+  --cluster "$CANARY_CLUSTER" \
+  --service "$CANARY_SERVICE" \
+  --task-definition "$REVERT_TASKDEF" \
+  --force-new-deployment >/dev/null
+ok "update-service called; ECS is rolling it out through the same canary strategy"
+
+hr
+if ! ecs_wait_rollout "$TIMEOUT" "$POLL"; then
+  err "the rollback rollout did not complete; check ./scripts/status.sh"
+  exit 1
 fi
 
 hr
-ok "rollback done"
+ok "rollback done: ${REVERT_IMAGE} is live"
 info "verify:     ./scripts/status.sh"
 info "dashboard:  $(app_url)"

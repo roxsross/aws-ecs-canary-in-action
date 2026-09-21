@@ -6,71 +6,73 @@ Cómo está armado el laboratorio y por qué cada pieza está donde está.
 
 ## 1. El mecanismo canary
 
-Un listener de ALB puede reenviar a **varios target groups con pesos**. El reparto
-se calcula por petición, de forma probabilística:
+**AWS real** usa la estrategia de canary nativa de ECS
+(`deployment_configuration` en `infra/terraform/ecs.tf`), lanzada en octubre de
+2025. Un solo servicio ECS, un ALB con dos target groups —`primary` (la
+revisión actual) y `alternate` (la revisión nueva)— y una *listener rule* de
+producción que ECS reescribe él mismo durante el rollout:
 
 ```
-regla por defecto del listener :80
-  forward
-    ├── target group stable  weight 95
-    └── target group canary  weight  5
+aws_ecs_service.app
+  deployment_configuration
+    strategy               = CANARY
+    canary_configuration { canary_percent = 10, canary_bake_time_in_minutes = 5 }
+    bake_time_in_minutes   = 5
+  alarms { enable = true, rollback = true, alarm_names = [...] }
+  load_balancer
+    advanced_configuration
+      alternate_target_group_arn = target group alternate
+      production_listener_rule   = listener rule de producción
+      role_arn                   = rol que deja a ECS mover la regla
 ```
 
-Los pesos son **relativos**, no porcentajes: `95/5` y `19/1` producen el mismo
-reparto. `scripts/weights.sh --canary 5` normaliza a 100 para que sea legible.
+Un rollout (`./scripts/canary-deploy.sh --tag v2`) es una sola llamada:
+`aws ecs update-service --task-definition ... --force-new-deployment`. De ahí en
+más, **ECS orquesta todo solo**:
 
-Mover tráfico es una sola llamada:
+1. crea la revisión nueva ("green") y la registra en el target group `alternate`;
+2. espera a que sus tareas estén sanas;
+3. mueve `canary_percent`% del tráfico de producción a `alternate` y hornea
+   `canary_bake_time_in_minutes` minutos, vigilando las alarmas de abajo;
+4. si las alarmas siguen en `OK`, mueve el resto del tráfico de una vez;
+5. hornea `bake_time_in_minutes` minutos más con ambas revisiones corriendo
+   (rollback instantáneo, sin reiniciar nada) y termina la revisión vieja.
 
-```bash
-aws elbv2 modify-listener --listener-arn "$ARN" --default-actions '[{
-  "Type": "forward",
-  "ForwardConfig": {
-    "TargetGroups": [
-      { "TargetGroupArn": "...stable", "Weight": 75 },
-      { "TargetGroupArn": "...canary", "Weight": 25 }
-    ],
-    "TargetGroupStickinessConfig": { "Enabled": false }
-  }
-}]'
-```
+Si cualquier alarma pasa a `ALARM` en cualquier momento, ECS revierte el
+tráfico a la revisión vieja y aborta el rollout — sin que ningún script tenga
+que sondear nada. `scripts/canary-deploy.sh` y `scripts/status.sh` solo leen
+`rolloutState` (`IN_PROGRESS` / `COMPLETED` / `FAILED`) para reportar el
+progreso al operador.
 
-Consecuencias que importan:
+**El laboratorio local** (`local/mini-alb`) sigue el diseño anterior a esta
+migración, a propósito: dos contenedores reales (`stable`/`canary`) detrás de
+un balanceador de juguete que reparte tráfico por **peso explícito**
+(`./scripts/weights.sh --target local --canary 25`), igual que un ALB real
+antes de que existiera la estrategia nativa. Es la forma más directa de
+enseñar *qué* hace un canary (pesos relativos, sorteo por petición, rollback
+como una escritura de dos números) antes de delegarlo a la orquestación de
+ECS. Ver la sección 8 para el detalle del mini-ALB.
 
-- **El rollback es instantáneo.** No baja imágenes ni arranca tareas: reescribe dos
-  números. Tarda lo que tarda una llamada a la API.
-- **Sin stickiness**, a propósito. Con sesiones pegajosas un usuario se quedaría
-  atrapado en la canary rota. Para un laboratorio queremos que cada petición sea
-  un sorteo nuevo.
-- **Un peso mayor que cero sobre un target group vacío devuelve 503** para esa
-  fracción del tráfico. Por eso `canary-deploy.sh` espera targets sanos *antes* de
-  mover el primer peso, y `weights.sh` avisa si vas a disparar en el pie.
+### Rutas forzadas (solo en el laboratorio local)
 
-### Rutas forzadas
-
-Cuatro reglas del listener permiten mirar una versión concreta sin tocar los pesos:
-
-| Prioridad | Condición | Destino |
-|---|---|---|
-| 10 | query string `track=canary` | target group canary |
-| 11 | query string `track=stable` | target group stable |
-| 20 | header `X-Canary: always` | target group canary |
-| 21 | header `X-Canary: never` | target group stable |
-
-De esto viven los enlaces "ver solo esta versión" del dashboard, y también
-`chaos.sh`: para que la escritura llegue a una tarea de la versión correcta, hace
-la petición con `?track=`.
+En `local/mini-alb`, cuatro reglas permiten mirar una versión concreta sin
+tocar los pesos, vía `?track=` o el header `X-Canary`. En AWS real esto ya no
+existe: no hay un track "canary" fijo al que apuntar, solo la revisión que ECS
+esté corriendo en cada target group en un momento dado.
 
 ---
 
 ## 2. Flujo de una petición
 
+En el laboratorio local (dos contenedores, pesos explícitos):
+
 ```
 navegador
-  └─> ALB :80
+  └─> mini-alb :8080
         └─> ¿coincide alguna regla forzada?
               sí -> target group indicado
               no  -> sorteo por pesos
-                      └─> tarea Fargate (:8080)
+                      └─> contenedor stable o canary
                             ├─ aplica la falla inyectada: latencia y/o 500
                             ├─ escribe el hit en DynamoDB (async)
                             ├─ suma al buffer EMF
@@ -80,6 +82,13 @@ navegador
 Las cabeceras de identidad son el truco que hace todo observable: el navegador, el
 generador de carga y CI cuentan el reparto leyendo `X-Track`, sin necesitar acceso
 a AWS.
+
+En AWS real no hay sorteo por pesos que la app pueda observar: el ALB reenvía
+siempre al target group que la *production listener rule* apunta en ese
+momento (gestionado por ECS), y la tarea que responde no sabe si es la
+revisión `primary` o `alternate` — `TRACK` no se setea, así que toda tarea se
+identifica como `stable` por defecto. `X-Track` sigue viajando en la
+respuesta, solo que en AWS siempre vale `stable`.
 
 ---
 
@@ -97,7 +106,7 @@ Node 22 con Express, sin build step y sin dependencias de frontend.
 | `GET /api/stats` | vista global: contadores, serie por minuto, últimas peticiones, estado de inyección de fallos, pesos |
 | `GET /api/config` | bootstrap del dashboard: paleta, identidad, capacidades |
 | `GET /api/whoami` | identidad detallada de la tarea |
-| `GET /api/weights` | pesos reales leídos del listener |
+| `GET /api/weights` | pesos reales leídos del listener. En AWS real siempre cae al modo "sin `LISTENER_ARN`" (no hay pesos fijos que leer); en local sí refleja el mini-ALB |
 | `GET/POST/DELETE /api/chaos` | inyección de fallos |
 | `POST /api/reset` | limpia los contadores |
 | `GET /metrics` | texto estilo Prometheus, por tarea |
@@ -185,7 +194,11 @@ Se emite cada 10 segundos con los valores agregados, no una línea por petición
 
 ### Las cuatro alarmas que deciden el rollback
 
-Todas apuntan **solo al target group de la canary**.
+En AWS real apuntan **al target group `alternate`** — ahí es donde corre la
+revisión nueva mientras ECS la está probando. Sus nombres están listados en
+`aws_ecs_service.app.alarms.alarm_names`, así que **ECS mismo las vigila**
+durante el rollout (`DescribeAlarms` interno) y revierte el tráfico si alguna
+pasa a `ALARM`; no hay ningún script haciendo polling.
 
 | Alarma | Métrica | Dispara con |
 |---|---|---|
@@ -194,12 +207,15 @@ Todas apuntan **solo al target group de la canary**.
 | `<proyecto>-canary-unhealthy` | `UnHealthyHostCount` (Max) | ≥ 1 |
 | `<proyecto>-canary-error-rate` | math sobre EMF: `100 * errors / requests` | > 5% |
 
-- `treatMissingData: notBreaching` en las cuatro: **sin tráfico en la canary no hay
-  fallo**, y al principio del rollout no hay datos.
+- `treatMissingData: notBreaching` en las cuatro: **sin tráfico en la nueva
+  revisión no hay fallo**, y al principio del rollout no hay datos.
 - `evaluation_periods = 1` y `period = 60` para que una demo en vivo reaccione
   rápido. En producción querrás 2 o 3 periodos para no reaccionar al ruido.
 - La de error rate viene de las métricas de la app, así que atrapa fallos que nunca
   llegan al ALB como 5xx.
+- Importante: **si una alarma ya está en `ALARM` al arrancar el rollout, ECS la
+  ignora** durante ese despliegue (para no bloquear un fix de un fallo previo).
+  Por eso `canary-deploy.sh` limpia el estado de las alarmas antes de empezar.
 
 ### Por qué el contenedor no tiene health check propio
 
@@ -210,28 +226,30 @@ juzga **el target group**, que es también quien alimenta las alarmas.
 
 ### El dashboard de CloudWatch
 
-`infra/terraform/monitoring.tf` crea `<proyecto>-canary`, con siete widgets:
+`infra/terraform/monitoring.tf` crea `<proyecto>-canary`, con siete widgets,
+comparando el target group `primary` (revisión actual) contra `alternate` (la
+revisión que ECS esté probando, si hay un rollout en curso):
 
 | Widget | Qué muestra |
 |---|---|
-| Traffic distribution | el porcentaje de tráfico de cada track, en vivo |
-| Requests per target group | volumen absoluto (`RequestCount`) por track |
-| 5xx per target group | errores del servidor por track, con la línea de la alarma |
-| p95 latency per target group | latencia por track, con la línea del presupuesto |
-| Healthy targets | targets sanos/enfermos por track |
-| Application metrics (EMF) | `RequestCount`/`ErrorCount` desde las métricas propias de la app |
+| Traffic distribution | el porcentaje de tráfico de la revisión nueva, en vivo |
+| Requests per target group | volumen absoluto (`RequestCount`) por target group |
+| 5xx per target group | errores del servidor por target group, con la línea de la alarma |
+| p95 latency per target group | latencia por target group, con la línea del presupuesto |
+| Healthy targets | targets sanos/enfermos por target group |
+| Application metrics (EMF) | `RequestCount`/`ErrorCount` agregados de toda la app |
 | Canary rollback triggers | estado de las cuatro alarmas, de un vistazo |
 
-El primero es el que responde la pregunta que más se hace en una demo: *¿cuánto
-tráfico está recibiendo la canary ahora mismo?* Se calcula con **metric math**,
-no leyendo el peso del listener (que vive en el ALB, no en CloudWatch), sino a
-partir del `RequestCount` real de cada target group:
+El primero responde la pregunta que más se hace en una demo: *¿cuánto tráfico
+está recibiendo la revisión nueva ahora mismo?* Se calcula con **metric math**,
+a partir del `RequestCount` real de cada target group (no hay un weight fijo
+que leer: ECS lo cambia por su cuenta durante el rollout):
 
 ```
-stable_requests = RequestCount(TargetGroup=stable)   ; visible=false, es la métrica base
-canary_requests = RequestCount(TargetGroup=canary)   ; visible=false, es la métrica base
-canary_pct = 100 * canary_requests / (stable_requests + canary_requests)
-stable_pct = 100 * stable_requests / (stable_requests + canary_requests)
+primary_requests   = RequestCount(TargetGroup=primary)    ; visible=false, es la métrica base
+alternate_requests = RequestCount(TargetGroup=alternate)  ; visible=false, es la métrica base
+alt_pct     = 100 * alternate_requests / (primary_requests + alternate_requests)
+primary_pct = 100 * primary_requests / (primary_requests + alternate_requests)
 ```
 
 Las métricas base van con `visible: false` porque solo existen para alimentar la
@@ -275,20 +293,20 @@ Task SG     ingress  8080      solo desde el SG del ALB
 Las tareas no son alcanzables directamente desde internet aunque tengan IP pública:
 el único ingress permitido viene del balanceador.
 
-### Los dos roles de ECS
+### Los tres roles de ECS
 
 | Rol | Quién lo usa | Para qué |
 |---|---|---|
 | execution role | el agente de ECS | bajar la imagen de ECR y escribir logs |
-| task role | la aplicación | DynamoDB sobre su tabla, y leer las reglas del listener |
+| task role | la aplicación | DynamoDB sobre su tabla |
+| ecs infrastructure role | ECS mismo (`ecs.amazonaws.com`) | crear/modificar el target group `alternate` y reescribir la *production listener rule* durante un rollout canary. Sin este rol, `deployment_configuration.strategy = "CANARY"` no puede mover tráfico |
 
-Ambos llevan una condición `aws:SourceAccount` en la política de confianza, que
-cierra el problema del *confused deputy*.
+Los dos primeros llevan una condición `aws:SourceAccount` en la política de
+confianza, que cierra el problema del *confused deputy*. El tercero usa la
+policy administrada de AWS `AmazonECSInfrastructureRolePolicyForLoadBalancers`
+(no hace falta escribirla a mano).
 
-El permiso de la tabla está limitado a **ese** ARN. El de
-`elasticloadbalancing:DescribeRules` va con `Resource: "*"` porque esa acción no
-admite permisos por recurso; es solo lectura y es opcional
-(`grant_listener_read = false` lo quita, y el dashboard pasa a estimar el reparto).
+El permiso de la tabla está limitado a **ese** ARN.
 
 ---
 
@@ -327,8 +345,11 @@ coinciden, la tarea muere con un error de formato de ejecutable.
 
 ## 8. El ALB de juguete
 
-`local/mini-alb/server.js` son unas 250 líneas de Node sin dependencias que imitan
-las partes del ALB que este laboratorio usa:
+`local/mini-alb/server.js` son unas 250 líneas de Node sin dependencias que
+imitan las partes de un ALB con pesos manuales. Es intencionalmente el modelo
+*anterior* a la migración de AWS real a la estrategia canary nativa de ECS
+(sección 1): sigue siendo la forma más directa de enseñar el mecanismo de
+pesos en sí, sin la orquestación de ECS por delante.
 
 - reenvío ponderado en la regla por defecto,
 - las mismas rutas forzadas (`?track=`, `X-Canary`),
@@ -349,17 +370,24 @@ Terraform expone una única salida, `canary_env`, con todo lo que los scripts
 necesitan:
 
 ```
-CANARY_REGION           CANARY_TG_STABLE        CANARY_ALARM_5XX
-CANARY_PROJECT          CANARY_TG_CANARY        CANARY_ALARM_LATENCY
-CANARY_CLUSTER          CANARY_SVC_STABLE       CANARY_ALARM_UNHEALTHY
-CANARY_ALB_DNS          CANARY_SVC_CANARY       CANARY_ALARM_ERRORRATE
-CANARY_ALB_ARN          CANARY_TASKDEF_STABLE   CANARY_ECR_REPO
-CANARY_LISTENER_ARN     CANARY_TASKDEF_CANARY   CANARY_ECR_URI
-CANARY_TABLE            CANARY_LOG_GROUP        CANARY_CONTAINER_NAME
-                                                CANARY_CONTAINER_PORT
+CANARY_REGION              CANARY_TG_PRIMARY        CANARY_ALARM_5XX
+CANARY_PROJECT             CANARY_TG_ALTERNATE      CANARY_ALARM_LATENCY
+CANARY_CLUSTER             CANARY_SERVICE           CANARY_ALARM_UNHEALTHY
+CANARY_ALB_DNS             CANARY_TASKDEF_FAMILY     CANARY_ALARM_ERRORRATE
+CANARY_ALB_ARN             CANARY_ECR_REPO          CANARY_CONTAINER_NAME
+CANARY_LISTENER_ARN        CANARY_ECR_URI           CANARY_CONTAINER_PORT
+CANARY_PRODUCTION_RULE_ARN CANARY_TABLE
+                           CANARY_LOG_GROUP
 ```
 
 `scripts/load-env.sh` la vuelca a `.canary.env`, que el resto de los scripts
 sourcea. Esa indirección es la razón de que `canary-deploy.sh`, `rollback.sh`
 y `status.sh` no necesiten saber nada de Terraform: solo leen variables de
 entorno.
+
+Un solo servicio (`CANARY_SERVICE`), una sola familia de task definitions
+(`CANARY_TASKDEF_FAMILY`) — el diseño anterior a esta migración tenía un par de
+cada uno (`_STABLE`/`_CANARY`). `CANARY_PRODUCTION_RULE_ARN` es nuevo: es la
+listener rule que `deployment_configuration.load_balancer.advanced_configuration`
+reescribe durante un rollout, y la que `weights.sh`/`status.sh` consultan de
+solo lectura para saber a qué target group apunta la producción ahora mismo.

@@ -11,8 +11,15 @@
 #   ./scripts/chaos.sh --clear                       # back to normal
 #
 # The setting is stored in DynamoDB and polled by every task, so it applies to a
-# whole track rather than to whichever container happened to answer. Requests are
-# pinned with ?track= so the write always lands on the intended version.
+# whole track rather than to whichever container happened to answer.
+#
+# On AWS: there is no separate canary track anymore (ECS's native canary
+# strategy runs one service; TRACK is not set, so every task reports itself as
+# "stable"), so --track defaults to stable there. Whatever revision ECS is
+# running when you inject the fault — old or new — is what breaks; that's what
+# makes the deployment's alarms fire and trigger its automatic rollback.
+# In local/ (docker compose), stable and canary are two real, separate
+# containers, so --track still defaults to canary there, as before.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -21,7 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 . "${SCRIPT_DIR}/lib.sh"
 
-TRACK="canary"
+TRACK=""
 FAIL_RATE=""
 LATENCY=""
 UNHEALTHY=""
@@ -34,7 +41,7 @@ usage() {
   print_header_help "${BASH_SOURCE[0]}"
   cat <<'EOF'
 Options
-  --track NAME       stable or canary (default: canary)
+  --track NAME       stable or canary (default: canary on local, stable on AWS)
   --fail-rate N      Percentage of requests answered with a 500 (0-100)
   --latency MS       Extra milliseconds added to every response
   --unhealthy        Answer /api/health with 503 so the ALB drops the targets
@@ -69,11 +76,6 @@ done
 
 require_tools curl jq
 
-case "$TRACK" in
-  stable | canary) ;;
-  *) die "--track must be stable or canary" ;;
-esac
-
 if [ -z "$BASE_URL" ]; then
   load_canary_env || true
   if [ -n "${CANARY_ALB_DNS:-}" ]; then
@@ -84,6 +86,20 @@ if [ -z "$BASE_URL" ]; then
   fi
 fi
 BASE_URL="${BASE_URL%/}"
+
+# local/ has two real tracks; AWS has one service that never sets TRACK, so
+# every task reports itself as "stable" — default accordingly.
+if [ -z "$TRACK" ]; then
+  case "$BASE_URL" in
+    *localhost* | *127.0.0.1*) TRACK="canary" ;;
+    *) TRACK="stable" ;;
+  esac
+fi
+
+case "$TRACK" in
+  stable | canary) ;;
+  *) die "--track must be stable or canary" ;;
+esac
 
 curl_args() {
   printf '%s\n' "-sS" "--max-time" "15"
@@ -170,7 +186,5 @@ hr
 info "now watch it land:"
 info "  ./scripts/status.sh --watch"
 info "  ./scripts/traffic-gen.sh --rps 10 --duration 120"
-if [ "$TRACK" = "canary" ]; then
-  info "alarms usually flip to ALARM within a period or two (60s by default)"
-  info "a rollout running in another terminal will roll itself back"
-fi
+info "alarms usually flip to ALARM within a period or two (60s by default)"
+info "a rollout running in another terminal (./scripts/canary-deploy.sh) will roll itself back"

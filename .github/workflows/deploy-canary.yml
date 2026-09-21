@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# Progressive canary rollout from CI.
+# Canary rollout from CI, using ECS's native deployment strategy.
 #
 # Setup, once:
 #   1. terraform apply the stack, with a remote backend so CI can read its state
@@ -7,10 +7,11 @@
 #   3. repository variables
 #        AWS_REGION    us-east-1
 #        PROJECT_NAME  canary-lab
-#   4. optional: a "production" environment with required reviewers, which turns
-#      the promote job into a manual approval gate
 #
-# No long lived access keys: the job assumes a role through OIDC.
+# No long lived access keys: the job assumes a role through OIDC. There is no
+# separate "promote" step: canary_percent, canary_bake_time_in_minutes and
+# bake_time_in_minutes in infra/terraform/ecs.tf drive the whole rollout,
+# including shifting the remaining traffic and terminating the old revision.
 # ---------------------------------------------------------------------------
 name: Deploy canary
 
@@ -21,33 +22,12 @@ on:
         description: "Image tag to roll out (also used as APP_VERSION)"
         required: true
         type: string
-      steps:
-        description: "Canary percentages, comma separated"
-        required: false
-        default: "5,25,50,100"
-        type: string
-      bake:
-        description: "Seconds to watch the alarms at each step"
-        required: false
-        default: "90"
-        type: string
-      canary_tasks:
-        description: "How many canary tasks to run"
-        required: false
-        default: "1"
-        type: string
-      promote:
-        description: "How to finish the rollout"
-        required: false
-        default: auto
-        type: choice
-        options: [auto, manual]
 
 permissions:
   contents: read
 
 concurrency:
-  # One rollout at a time: two overlapping runs would fight over the weights.
+  # One rollout at a time: ECS only runs one deployment per service anyway.
   group: canary-rollout
   cancel-in-progress: false
 
@@ -90,7 +70,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
   rollout:
-    name: Shift traffic
+    name: Canary rollout
     needs: build
     runs-on: ubuntu-latest
     # Point this at a GitHub environment with reviewers to gate the rollout itself.
@@ -122,23 +102,16 @@ jobs:
           {
             echo "### Before"
             echo '```json'
-            ./scripts/status.sh --json | jq '{split, services, targets, alarmsFiring}'
+            ./scripts/status.sh --json | jq '{service, targets, alarmsFiring}'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Canary rollout
         run: |
-          extra=""
-          if [ "${{ inputs.promote }}" = "manual" ]; then
-            extra="--no-promote"
-          fi
           ./scripts/canary-deploy.sh \
             --image "${{ needs.build.outputs.image }}" \
-            --steps "${{ inputs.steps }}" \
-            --bake "${{ inputs.bake }}" \
-            --canary-tasks "${{ inputs.canary_tasks }}" \
-            --yes \
-            $extra
+            --version "${{ inputs.tag }}" \
+            --yes
 
       - name: State after the rollout
         if: always()
@@ -146,61 +119,20 @@ jobs:
           {
             echo "### After"
             echo '```json'
-            ./scripts/status.sh --json | jq '{split, services, targets, alarmsFiring}'
+            ./scripts/status.sh --json | jq '{service, targets, alarmsFiring}'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # canary-deploy.sh rolls back on its own when an alarm fires. This is the
-      # belt and braces for anything else that could kill the job, like a runner
-      # timeout partway through a traffic shift.
-      - name: Make sure traffic is back on stable
+      # canary-deploy.sh polls ECS's own rollout state; ECS rolls back on its
+      # own when an alarm fires. This is the belt and braces for anything else
+      # that could kill the job, like a runner timeout partway through.
+      - name: Make sure the previous revision is running if the rollout failed
         if: failure()
         run: |
-          echo "the rollout failed, forcing traffic back to stable" >&2
-          ./scripts/rollback.sh --yes || true
+          echo "the rollout did not complete, checking whether traffic is already on the previous revision" >&2
+          ./scripts/status.sh --json | jq -r '.service.rolloutState' >&2
           {
-            echo "### Rolled back"
-            echo "The rollout failed and traffic was returned to the stable track."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  promote:
-    name: Promote to stable
-    needs: [build, rollout]
-    if: inputs.promote == 'manual'
-    runs-on: ubuntu-latest
-    # Add required reviewers to this environment for a real approval gate.
-    environment: production
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: canary-promote-${{ github.run_id }}
-
-      - uses: hashicorp/setup-terraform@v4
-        with:
-          terraform_version: 1.16.3
-          terraform_wrapper: false
-
-      - name: Load the deployment environment
-        run: |
-          terraform -chdir=infra/terraform init -input=false
-          ./scripts/load-env.sh --region "${AWS_REGION}"
-
-      - name: Promote
-        run: ./scripts/promote.sh --image "${{ needs.build.outputs.image }}" --yes
-
-      - name: Final state
-        if: always()
-        run: |
-          {
-            echo "### Promoted"
-            echo '```json'
-            ./scripts/status.sh --json | jq '{split, services, targets}'
-            echo '```'
+            echo "### Rollout did not complete"
+            echo "Check the job log and \`./scripts/status.sh\`. If ECS's own rollback didn't"
+            echo "already revert it, run \`./scripts/rollback.sh\`."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -254,6 +254,19 @@ ecs_start_rollout() {
   printf '%s\n' "$new_taskdef"
 }
 
+# One line summary of the canary strategy configured in Terraform, for humans
+# watching a rollout start.
+canary_deployment_summary() {
+  ecs_service_json | jq -r '
+    .deploymentConfiguration as $dc
+    | if $dc.strategy == "CANARY" then
+        "\($dc.canaryConfiguration.canaryPercent)% for \($dc.canaryConfiguration.canaryBakeTimeInMinutes)min, then 100% (bake \($dc.bakeTimeInMinutes // 0)min)"
+      else
+        ($dc.strategy // "ROLLING")
+      end
+  '
+}
+
 # Polls rolloutState until it leaves IN_PROGRESS, printing progress. Returns 0
 # for COMPLETED, 1 for anything else (FAILED, or timeout).
 ecs_wait_rollout() {

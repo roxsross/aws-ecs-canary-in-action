@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# Reads and shifts the traffic split. This is the single knob the whole canary
-# flow turns: the ALB listener's default rule forwards to two target groups with
-# weights, and moving those weights moves real user traffic.
+# Shows the traffic split.
 #
-#   ./scripts/weights.sh                          # show the current split
-#   ./scripts/weights.sh --canary 5               # 5% to the canary
-#   ./scripts/weights.sh --canary 100             # everything to the canary
-#   ./scripts/weights.sh --stable 90 --canary 10  # explicit weights
-#   ./scripts/weights.sh --target local --canary 25   # the docker compose mini-alb
+#   ./scripts/weights.sh                              # AWS: read-only status
+#   ./scripts/weights.sh --target local               # the docker compose mini-alb
+#   ./scripts/weights.sh --target local --canary 25    # local only: set the split by hand
 #
-# Weights are relative, not percentages: 90/10 and 9/1 are the same split. The
-# script normalises to 100 when you use --canary on its own.
+# On AWS, traffic weighting is owned entirely by ECS's native canary strategy
+# (deployment_configuration in infra/terraform/ecs.tf): there is no listener
+# weight left to set by hand anymore, so this only reads and reports what ECS
+# is doing. To change how traffic shifts, edit var.canary_percent /
+# var.canary_bake_time_in_minutes and re-apply, then start a rollout with
+# ./scripts/canary-deploy.sh.
+#
+# local/ is unaffected: the docker compose mini-alb still takes explicit
+# weights, exactly as before, since it doesn't use ECS at all.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -29,9 +32,9 @@ usage() {
   print_header_help "${BASH_SOURCE[0]}"
   cat <<'EOF'
 Options
-  --canary N        Canary weight. Alone, it means N% and stable becomes 100-N
-  --stable N        Stable weight (use together with --canary for raw weights)
-  --target WHERE    aws (default) or local for the docker compose mini-alb
+  --target WHERE    aws (default, read-only) or local for the docker compose mini-alb
+  --canary N        local only: canary weight. Alone, it means N% and stable becomes 100-N
+  --stable N        local only: stable weight (use together with --canary for raw weights)
   --url URL         mini-alb base URL (default: http://localhost:8080)
   --region REGION   AWS region
   -h, --help        This help
@@ -96,40 +99,24 @@ fi
 
 [ "$TARGET" = "aws" ] || die "unknown --target '${TARGET}' (use aws or local)"
 
+if [ -n "$STABLE" ] || [ -n "$CANARY" ]; then
+  die "AWS traffic weighting is owned by ECS's native canary strategy; there is no weight to set by hand. Start a rollout with ./scripts/canary-deploy.sh instead."
+fi
+
 # --------------------------------------------------------------------- aws ----
 
 require_tools aws jq
-require_canary_env CANARY_LISTENER_ARN CANARY_TG_STABLE CANARY_TG_CANARY
+require_canary_env CANARY_CLUSTER CANARY_SERVICE CANARY_TG_PRIMARY CANARY_TG_ALTERNATE
 
-if [ -z "$CANARY" ]; then
-  step "current split on the listener"
-  CURRENT="$(alb_weights)"
-  CURRENT_STABLE="${CURRENT%% *}"
-  CURRENT_CANARY="${CURRENT##* }"
-  info "weights   stable=${CURRENT_STABLE} canary=${CURRENT_CANARY}"
-  print_split_bar "$CURRENT_STABLE" "$CURRENT_CANARY"
-  info "healthy   stable=$(tg_healthy_count "$CANARY_TG_STABLE") canary=$(tg_healthy_count "$CANARY_TG_CANARY")"
-  exit 0
+step "current rollout state"
+STATE="$(ecs_rollout_state)"
+PRODUCTION_TG="$(alb_production_target_group 2>/dev/null || printf 'unknown')"
+info "rollout state    ${STATE}"
+info "production ->    $([ "$PRODUCTION_TG" = "$CANARY_TG_PRIMARY" ] && printf 'primary' || printf 'alternate') target group"
+info "canary strategy  $(canary_deployment_summary)"
+info "healthy          primary=$(tg_healthy_count "$CANARY_TG_PRIMARY") alternate=$(tg_healthy_count "$CANARY_TG_ALTERNATE")"
+
+if [ "$STATE" = "IN_PROGRESS" ]; then
+  info ""
+  info "a canary rollout is shifting traffic right now:  ./scripts/status.sh --watch"
 fi
-
-BEFORE="$(alb_weights)"
-step "shifting traffic: stable=${STABLE} canary=${CANARY}"
-info "before    stable=${BEFORE%% *} canary=${BEFORE##* }"
-
-# A weight above zero with no healthy targets behind it means 5xx for that share
-# of traffic, so say it out loud rather than letting the demo fail quietly.
-if [ "$CANARY" -gt 0 ]; then
-  HEALTHY="$(tg_healthy_count "$CANARY_TG_CANARY")"
-  if [ "$HEALTHY" -eq 0 ]; then
-    warn "the canary target group has no healthy targets right now"
-    warn "sending it ${CANARY} weight will return 503 for that share of requests"
-    confirm "shift anyway?" || die "aborted"
-  fi
-fi
-
-alb_set_weights "$STABLE" "$CANARY"
-AFTER="$(alb_weights)"
-ok "listener updated"
-info "after     stable=${AFTER%% *} canary=${AFTER##* }"
-print_split_bar "${AFTER%% *}" "${AFTER##* }"
-info "watch it live at $(app_url)"

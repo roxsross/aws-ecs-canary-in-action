@@ -13,9 +13,6 @@ SHELL := /bin/bash
 PROJECT      ?= canary-lab
 TAG          ?= v1
 REGION       ?= $(or $(AWS_REGION),us-east-1)
-STEPS        ?= 5,25,50,100
-BAKE         ?= 90
-CANARY_TASKS ?= 1
 RPS          ?= 10
 DURATION     ?= 60
 
@@ -97,30 +94,23 @@ env: ## Regenerate .canary.env from terraform output
 ##@ Canary flow
 
 .PHONY: status watch
-status: ## Show the traffic split, services, target health and alarms
+status: ## Show the rollout state, target health and alarms
 	$(SCRIPTS)/status.sh
 
 watch: ## Same as status, refreshing
 	$(SCRIPTS)/status.sh --watch
 
 .PHONY: canary
-canary: ## Progressive rollout with automatic rollback (make canary TAG=v2)
-	$(SCRIPTS)/canary-deploy.sh --tag $(TAG) --steps $(STEPS) --bake $(BAKE) --canary-tasks $(CANARY_TASKS)
+canary: ## Canary rollout using ECS's native strategy (make canary TAG=v2)
+	$(SCRIPTS)/canary-deploy.sh --tag $(TAG)
 
-.PHONY: promote rollback
-promote: ## Promote a version to stable (make promote TAG=v2)
-	$(SCRIPTS)/promote.sh --tag $(TAG)
-
-rollback: ## Send all traffic back to stable, now
+.PHONY: rollback
+rollback: ## Redeploy the previous task definition, right now
 	$(SCRIPTS)/rollback.sh
 
 .PHONY: weights
-weights: ## Show or set the split (make weights CANARY=25)
-	@if [ -n "$(CANARY)" ]; then \
-		$(SCRIPTS)/weights.sh --canary $(CANARY); \
-	else \
-		$(SCRIPTS)/weights.sh; \
-	fi
+weights: ## Show the current rollout / traffic status (AWS: read only)
+	$(SCRIPTS)/weights.sh
 
 .PHONY: traffic
 traffic: ## Generate traffic and report the observed split
@@ -139,22 +129,22 @@ chaos-show: ## Show what is currently injected
 ##@ Guided demos
 
 .PHONY: demo-rollout
-demo-rollout: ## Happy path: push TAG, roll it out, promote
-	@printf '\n$(BOLD)Happy path$(RESET) $(DIM)push $(TAG), shift traffic in steps, promote$(RESET)\n\n'
+demo-rollout: ## Happy path: push TAG, let ECS roll it out
+	@printf '\n$(BOLD)Happy path$(RESET) $(DIM)push $(TAG), ECS shifts traffic and bakes on its own$(RESET)\n\n'
 	$(MAKE) push TAG=$(TAG)
-	$(SCRIPTS)/canary-deploy.sh --tag $(TAG) --steps $(STEPS) --bake $(BAKE)
+	$(SCRIPTS)/canary-deploy.sh --tag $(TAG) --yes
 	$(MAKE) status
 
 .PHONY: demo-rollback
-demo-rollback: ## Failure path: inject a fault and watch it roll itself back
-	@printf '\n$(BOLD)Failure path$(RESET) $(DIM)the canary misbehaves, alarms fire, traffic goes back$(RESET)\n\n'
+demo-rollback: ## Failure path: start a rollout, break it mid-flight, watch ECS revert it
+	@printf '\n$(BOLD)Failure path$(RESET) $(DIM)a rollout starts, the new revision misbehaves, ECS reverts it on its own$(RESET)\n\n'
 	@printf '  1. run this in another terminal:  make watch\n\n'
-	$(SCRIPTS)/weights.sh --canary 25
+	$(SCRIPTS)/canary-deploy.sh --tag $(TAG) --yes &
+	@sleep 20
 	$(SCRIPTS)/chaos.sh --break
-	@printf '\n  waiting 90s for the alarms to notice...\n\n'
-	@sleep 90
+	@printf '\n  waiting for ECS to notice and roll back...\n\n'
+	wait
 	$(SCRIPTS)/status.sh
-	$(SCRIPTS)/rollback.sh --yes
 	$(SCRIPTS)/chaos.sh --clear
 
 ##@ Checks
