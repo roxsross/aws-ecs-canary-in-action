@@ -1,9 +1,11 @@
 # ECS Canary in Action
 
-Laboratorio de **despliegues canary en Amazon ECS Fargate**. La app que se
-despliega funciona además como **monitor de tráfico en vivo**: en el navegador
-ves cómo se reparten las peticiones entre la versión estable y la canary,
-mientras movés los pesos del balanceador.
+Laboratorio de **despliegues canary en Amazon ECS Fargate**. En AWS real usa la
+estrategia de canary nativa de ECS (lanzada en 2025): un solo servicio, y ECS
+mismo mueve el tráfico, hornea y revierte si algo sale mal. En local, un
+balanceador de juguete con dos versiones reales enseña el mecanismo de pesos
+paso a paso, sin la orquestación por delante. La app que se despliega funciona
+además como **monitor de tráfico en vivo**.
 
 [![CI](https://github.com/roxsross/aws-ecs-canary-in-action/actions/workflows/ci.yml/badge.svg)](https://github.com/roxsross/aws-ecs-canary-in-action/actions/workflows/ci.yml)
 [![Infrastructure (Terraform)](https://github.com/roxsross/aws-ecs-canary-in-action/actions/workflows/infra-terraform.yml/badge.svg)](https://github.com/roxsross/aws-ecs-canary-in-action/actions/workflows/infra-terraform.yml)
@@ -17,10 +19,14 @@ mientras movés los pesos del balanceador.
 
 ## Qué vas a practicar
 
-- Repartir tráfico real con **weighted target groups** de un ALB (95/5, 50/50, 100/0).
-- Ver la distribución **en vivo**, comparando lo que pediste con lo que realmente pasa.
+- Un rollout canary **orquestado por ECS**: crea la revisión nueva, hornea con
+  un porcentaje chico de tráfico y promueve el resto solo, sin scripts que
+  muevan pesos a mano.
+- Ver la distribución **en vivo**, comparando la revisión nueva contra la actual.
 - **Simular un incidente de forma controlada** y ver cómo las alarmas de
-  CloudWatch disparan el **rollback automático**.
+  CloudWatch disparan el **rollback automático**, sin intervención humana.
+- El mecanismo de pesos explícito, en el laboratorio local, antes de delegarlo
+  a la orquestación de ECS.
 - Todo esto en **CI/CD con GitHub Actions**, usando OIDC (sin claves de acceso).
 
 ![Contenedores del laboratorio local](docs/images/local2.png)
@@ -32,39 +38,41 @@ flowchart LR
     users["usuarios<br/>navegador · curl · CI"]
 
     subgraph aws["AWS Cloud"]
-        alb["Application Load Balancer<br/>listener :80<br/>regla por defecto con pesos"]
+        alb["Application Load Balancer<br/>listener rule de producción"]
 
-        subgraph ecs["Amazon ECS · Fargate"]
+        subgraph ecs["Amazon ECS · Fargate<br/>un servicio, canary strategy"]
             direction TB
-            tgs["target group<br/>stable"]
-            tgc["target group<br/>canary"]
-            svcs["servicio stable<br/>v1 · N tareas"]
-            svcc["servicio canary<br/>v2 · 1 tarea"]
-            tgs --> svcs
-            tgc --> svcc
+            tgp["target group<br/>primary"]
+            tga["target group<br/>alternate"]
+            svcp["revisión actual<br/>N tareas"]
+            svca["revisión nueva<br/>durante el rollout"]
+            tgp --> svcp
+            tga --> svca
         end
 
         ddb[("DynamoDB<br/>contadores compartidos")]
-        cw["CloudWatch<br/>alarmas de la canary"]
+        cw["CloudWatch<br/>alarmas del rollout"]
     end
 
     ecr["Amazon ECR"]
 
     users --> alb
-    alb -->|"peso 95"| tgs
-    alb -->|"peso 5"| tgc
-    svcs --> ddb
-    svcc --> ddb
-    ecr -.->|"imagen"| svcs
-    ecr -.->|"imagen"| svcc
-    svcc -.->|"5xx · latencia · health"| cw
-    cw -.->|"ALARM · rollback"| alb
+    alb -->|"producción hoy"| tgp
+    alb -.->|"durante un rollout"| tga
+    svcp --> ddb
+    svca --> ddb
+    ecr -.->|"imagen"| svcp
+    ecr -.->|"imagen"| svca
+    svca -.->|"5xx · latencia · health"| cw
+    cw -.->|"ALARM · ECS revierte"| alb
 ```
 
-El único elemento que mueve tráfico es la regla por defecto del listener. Las
-dos versiones corren siempre; lo que cambia es el peso que reciben. Eso hace que
-el rollback sea instantáneo (reescribir dos números) y que las dos versiones
-sean observables al mismo tiempo con tráfico real.
+ECS mueve el tráfico él mismo durante un rollout: crea la revisión nueva,
+la registra en el target group `alternate`, hornea con un porcentaje chico de
+tráfico vigilando las alarmas, y si todo va bien mueve el resto y termina la
+revisión vieja. Si una alarma dispara, revierte solo. El laboratorio local usa
+un mecanismo más simple y explícito (pesos a mano) para enseñar la idea antes
+de delegarla a ECS — ver [docs/architecture.md](docs/architecture.md).
 
 ## Requisitos
 
@@ -139,9 +147,10 @@ make push TAG=v1
 ```
 
 `terraform apply` crea toda la infraestructura del diagrama de arriba: la red
-(o referencia la tuya, ver abajo), el ALB con sus dos target groups, el cluster
-ECS con los servicios `stable`/`canary`, la tabla de DynamoDB, las 4 alarmas de
-CloudWatch y su dashboard, y el repositorio de ECR. `make push` construye la
+(o referencia la tuya, ver abajo), el ALB con sus target groups `primary`/
+`alternate`, el cluster ECS con un servicio configurado con la estrategia de
+canary nativa (`deployment_configuration`), la tabla de DynamoDB, las 4 alarmas
+de CloudWatch y su dashboard, y el repositorio de ECR. `make push` construye la
 imagen (multi-arquitectura, amd64+arm64, así corre en Fargate sin importar
 `cpu_architecture` ni en qué máquina se compiló) y la sube.
 
@@ -161,21 +170,22 @@ Con `vpc_id` seteado, Terraform no crea nada de red y usa la tuya.
 
 ### Siguientes pasos
 
-Con el `apply` y el primer `push` hechos, el servicio `stable` ya está sirviendo
+Con el `apply` y el primer `push` hechos, el servicio ya está sirviendo
 tráfico real:
 
 ```bash
-make status                                                      # split, servicios, targets, alarmas
+make status                                                      # rollout, targets, alarmas
 open "$(terraform -chdir=infra/terraform output -raw app_url)"   # el dashboard
 ```
 
 Si `make status` no muestra targets sanos todavía, dale unos segundos: el
 health check del target group tarda un par de ciclos en confirmarlo.
 
-De acá en más, el flujo es hacer un rollout progresivo de una versión nueva
-(`make push TAG=v2` + `./scripts/canary-deploy.sh --tag v2`) o simular un
-incidente y ver el rollback automático (`./scripts/chaos.sh --break`) — guionado
-paso a paso en [docs/canary-playbook.md](docs/canary-playbook.md).
+De acá en más, el flujo es hacer un rollout de una versión nueva (`make push
+TAG=v2` + `./scripts/canary-deploy.sh --tag v2`, y ECS se encarga del resto) o
+simular un incidente durante el rollout y ver el rollback automático
+(`./scripts/chaos.sh --break`) — guionado paso a paso en
+[docs/canary-playbook.md](docs/canary-playbook.md).
 
 ## Seguir leyendo
 

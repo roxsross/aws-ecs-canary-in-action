@@ -14,18 +14,19 @@ make help
 |---|---|
 | `make local` / `make local-down` | laboratorio local con docker compose |
 | `make push TAG=v2` | construye (multi-arch) y sube la imagen |
-| `make status` / `make watch` | estado del despliegue |
-| `make canary TAG=v2` | rollout progresivo con rollback automático |
-| `make weights CANARY=25` | mueve el tráfico a mano |
+| `make status` / `make watch` | estado del rollout, targets y alarmas |
+| `make canary TAG=v2` | dispara un rollout con la estrategia canary nativa de ECS |
+| `make weights` | AWS: solo lectura de a qué target group apunta la producción. `local`: sigue aceptando pesos explícitos |
 | `make traffic RPS=20` | genera carga y reporta el reparto observado |
 | `make break` / `make fix` | inyecta y limpia fallos |
-| `make rollback` | todo el tráfico a la estable |
-| `make promote TAG=v2` | promueve una versión a estable |
+| `make rollback` | redeploya la revisión anterior, ya |
 | `make lint` | shellcheck, terraform fmt/validate, node, Trivy |
 | `make smoke` | corre el smoke test contra una instancia (ver abajo) |
 | `make clean` | borra artefactos locales y `.canary.env` |
 
-Cada script en `scripts/` acepta `--help`.
+Cada script en `scripts/` acepta `--help`. En AWS real ya no hay `make promote`:
+la promoción a 100% de tráfico ocurre automáticamente cuando el rollout llega a
+`COMPLETED`.
 
 ## El dashboard
 
@@ -33,24 +34,18 @@ La app se sirve a sí misma y se mide a sí misma: manda solicitudes de prueba a
 `/api/hit` desde tu navegador, así que la distribución que ves es tráfico real
 pasando por el balanceador.
 
-| Barra | Qué significa |
-|---|---|
-| **Distribución configurada (ALB)** | los pesos del listener, leídos en vivo |
-| **Distribución observada (cliente)** | lo que le está pasando a tu navegador |
-| **Distribución global (todas las tareas)** | lo que le pasa a todo el mundo, contado en DynamoDB |
+En **local**, la barra "distribución configurada (ALB)" refleja los pesos que
+le pasaste al mini-ALB con `weights.sh --target local`. En **AWS real** esa
+barra cae al modo "sin `LISTENER_ARN`": no hay pesos fijos que la app pueda
+leer, porque ECS los mueve por su cuenta durante un rollout. La forma de ver el
+reparto real en AWS es el dashboard de CloudWatch (widget "Traffic
+distribution"), no el de la app.
 
-Con pocas peticiones las tres difieren; al subir el ritmo convergen: los pesos
-son probabilidad, no una distribución exacta.
+Rutas forzadas por `?track=`/`X-Canary` solo existen en `local/mini-alb`; en
+AWS real no hay un track "canary" fijo al que apuntar.
 
-Para ver una versión concreta sin tocar los pesos:
-
-```bash
-curl "http://$ALB/?track=canary"          # por query string
-curl -H 'X-Canary: always' "http://$ALB/" # por header
-```
-
-El mismo número (porcentaje de tráfico de la canary) también está en
-CloudWatch: `terraform output cloudwatch_dashboard_url`.
+El porcentaje de tráfico de la revisión nueva está en CloudWatch:
+`terraform output cloudwatch_dashboard_url`.
 
 ## Pruebas: cómo correrlas y dónde ver el resultado
 
@@ -152,11 +147,12 @@ para problemas de instalación y configuración:
 | Síntoma | Causa probable |
 |---|---|
 | Las tareas arrancan y mueren en bucle | la imagen no existe con ese tag, o se construyó con `--platform` limitado a una arquitectura que no coincide con `var.cpu_architecture` |
-| `503` desde el ALB | no hay targets sanos. `./scripts/status.sh` y mirá `healthy=` |
+| `503` desde el ALB | no hay targets sanos. `./scripts/status.sh` y mirá el healthy de cada target group |
 | El dashboard dice "dynamodb (degradado)" | la tabla no existe o al rol de la tarea le falta permiso |
-| El peso del ALB sale como "estimado" | falta `LISTENER_ARN` o el permiso `elasticloadbalancing:DescribeRules` |
+| El peso del ALB en el dashboard de la app sale como "estimado" | esperado en AWS real: no hay `LISTENER_ARN` fijo que leer. Mirá el dashboard de CloudWatch en su lugar |
 | `missing environment: CANARY_...` | falta `.canary.env`. Corré `./scripts/load-env.sh` |
-| El rollout revierte enseguida | había una alarma en `ALARM` de una demo anterior; se limpia salvo `--no-reset-alarms` |
+| `canary-deploy.sh` dice que ya hay un rollout en curso | `rolloutState=IN_PROGRESS` en `./scripts/status.sh`. Esperalo o corré `./scripts/rollback.sh` |
+| El rollout revierte enseguida | había una alarma en `ALARM` de una demo anterior; ECS la ignora al arrancar salvo que la limpies primero (`canary-deploy.sh` ya lo hace, salvo `--no-reset-alarms`) |
 
 ```bash
 aws logs tail /ecs/canary-lab --since 15m --follow
@@ -193,25 +189,24 @@ aws-ecs-canary-in-action/
 │   ├── variables.tf            todas las variables de entrada, documentadas y con validación
 │   ├── vpc.tf                  red: crea una VPC mínima o referencia una existente
 │   ├── network.tf              security groups (ALB y tareas)
-│   ├── alb.tf                  Application Load Balancer, target groups, listener con pesos
-│   ├── ecs.tf                  cluster, task definitions y servicios (stable + canary)
+│   ├── alb.tf                  ALB, target groups primary/alternate, listener rule de producción
+│   ├── ecs.tf                  cluster, task definition y el único servicio (deployment_configuration canary)
 │   ├── ecr.tf                  repositorio de imágenes (opcional, on/off por variable)
 │   ├── dynamodb.tf              tabla de contadores de tráfico
-│   ├── iam.tf                  roles de ejecución y de tarea, con permisos mínimos
-│   ├── monitoring.tf            alarmas CloudWatch + dashboard con el % de tráfico canary
+│   ├── iam.tf                  roles de ejecución, de tarea y de infraestructura ECS
+│   ├── monitoring.tf            alarmas CloudWatch (vigiladas por ECS) + dashboard
 │   ├── outputs.tf               URLs del dashboard, contrato canary_env para los scripts
 │   └── terraform.tfvars.example
 │
 ├── scripts/                    El flujo canary, cada uno con --help
 │   ├── build-push.sh            build multi-arch + push de la imagen a ECR
 │   ├── load-env.sh              terraform output -> .canary.env
-│   ├── weights.sh                lee o cambia los pesos del listener
-│   ├── canary-deploy.sh          rollout progresivo con bake time y rollback automático
-│   ├── promote.sh                promueve la canary a estable
-│   ├── rollback.sh               todo el tráfico de vuelta a estable, ya
+│   ├── weights.sh                AWS: solo lectura del target group en producción. local: pesos explícitos
+│   ├── canary-deploy.sh          dispara un rollout (ECS lo orquesta) y reporta su progreso
+│   ├── rollback.sh               redeploya la revisión anterior a través de la misma estrategia canary
 │   ├── chaos.sh                  inyecta o limpia fallos en una versión
 │   ├── traffic-gen.sh            genera carga y reporta el split observado
-│   ├── status.sh                  estado consolidado: split, servicios, targets, alarmas
+│   ├── status.sh                  rolloutState, target group en producción, targets, alarmas
 │   └── lib.sh                    helpers compartidos (logging, parseo de --help)
 │
 ├── local/                      Laboratorio sin cuenta de AWS
@@ -226,7 +221,7 @@ aws-ecs-canary-in-action/
 ├── .github/workflows/
 │   ├── ci.yml                    lint + build de imagen + integración local, en cada PR
 │   ├── infra-terraform.yml       fmt/validate/plan (y apply manual) de Terraform
-│   ├── deploy-canary.yml         build, push y rollout progresivo contra AWS real
+│   ├── deploy-canary.yml         build, push y rollout canary nativo contra AWS real
 │   └── rollback.yml              rollback manual disparable desde GitHub Actions
 │
 └── Makefile                    todos los comandos anteriores, con `make help`
