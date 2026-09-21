@@ -103,6 +103,8 @@ make local
 open http://localhost:8080
 ```
 
+![Contenedores del laboratorio local](docs/images/docker.png)
+
 | URL | Qué es |
 |---|---|
 | http://localhost:8080 | el dashboard, detrás del balanceador |
@@ -119,6 +121,8 @@ Mueve el tráfico y mirá el dashboard reaccionar:
 
 make local-down
 ```
+
+![Dashboard con tráfico en el laboratorio local](docs/images/local.png)
 
 ## Quickstart 2: desplegar en AWS con Terraform
 
