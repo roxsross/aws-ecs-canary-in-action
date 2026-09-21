@@ -1,11 +1,4 @@
-/* ---------------------------------------------------------------------------
-   Canary lab on ECS Fargate.
-
-   Networking is handled in vpc.tf: by default a minimal VPC is created for the
-   lab; set var.vpc_id to plug into one you already have instead. Either way,
-   the rest of this stack reads local.vpc_id / local.public_subnet_ids and does
-   not need to know which path was taken.
-   --------------------------------------------------------------------------- */
+# Canary lab on ECS Fargate. Networking is handled in vpc.tf.
 
 data "aws_caller_identity" "current" {}
 
@@ -18,8 +11,8 @@ locals {
 
   ecr_repository_url = "${local.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/${local.ecr_repository_name}"
 
-  # Composed rather than looked up, so the stack never depends on the image
-  # existing yet and `terraform plan` works on a clean account.
+  # Composed rather than looked up, so `terraform plan` works even before the
+  # image exists in the registry.
   container_image = var.container_image != "" ? var.container_image : "${local.ecr_repository_url}:${var.image_tag}"
 
   table_name         = "${var.project_name}-traffic"
@@ -46,14 +39,9 @@ locals {
     var.tags,
   )
 
-  # Environment shared by both tracks. Per-track values are appended in ecs.tf.
-  #
-  # ADMIN_TOKEN travels as a plain environment variable, visible to anyone who
-  # can call ecs:DescribeTaskDefinition. That is an accepted tradeoff for a lab
-  # meant to be spun up in one command: wiring a real secret would mean either
-  # AWS Secrets Manager (extra resource, extra IAM) or SSM Parameter Store
-  # SecureString, both fine upgrades if you keep this running past the demo.
-  # See the "Seguridad" section in the README before using this in anything real.
+  # Shared by both tracks; per-track values are appended in ecs.tf.
+  # ADMIN_TOKEN travels as a plain env var (visible via ecs:DescribeTaskDefinition).
+  # Accepted lab tradeoff — see "Seguridad" in the README before using this for real.
   base_environment = [
     { name = "PROJECT_NAME", value = var.project_name },
     { name = "PORT", value = tostring(var.container_port) },

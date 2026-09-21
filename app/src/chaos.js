@@ -1,12 +1,8 @@
 'use strict';
 
-/**
- * Fault injection used to prove the automatic rollback path.
- *
- * Two sources are combined with max(), so you can either ship a deliberately
- * broken image (FAIL_RATE / LATENCY_MS env vars) or break a running track on
- * demand from the dashboard (state stored in DynamoDB and polled by every task).
- */
+// Combines two fault sources with max(): a deliberately broken image
+// (FAIL_RATE / LATENCY_MS env vars) or a runtime override from the dashboard
+// (state stored in DynamoDB, polled by every task).
 function createChaosEngine({ config, store }) {
   function stateFor(track) {
     const remote = store.getChaosLocal()?.[track] || {};

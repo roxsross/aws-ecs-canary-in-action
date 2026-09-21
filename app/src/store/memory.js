@@ -10,11 +10,8 @@ const {
 
 const RECENT_LIMIT = 250;
 
-/**
- * Process local store. Used for `docker run` demos, unit-less smoke tests and as
- * the safety net when DynamoDB is unreachable. Counters are per task, so in a
- * multi task deployment each task only knows about its own traffic.
- */
+// Process-local store, per task: used for `docker run` demos and as the
+// fallback when DynamoDB is unreachable.
 function createMemoryStore({ reason = 'no TABLE_NAME configured' } = {}) {
   const aggregates = new Map(); // `${track}#${version}` -> row
   const series = new Map(); // `${minute}#${track}` -> row

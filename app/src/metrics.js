@@ -2,13 +2,9 @@
 
 const MAX_LATENCY_SAMPLES = 100;
 
-/**
- * Emits CloudWatch Embedded Metric Format (EMF) log lines. CloudWatch Logs
- * extracts them into real metrics with no extra IAM permission and no agent, so
- * the canary gets per-track RequestCount / ErrorCount / LatencyMs for free.
- *
- * Also keeps process counters for the plain-text /metrics endpoint.
- */
+// Emits CloudWatch Embedded Metric Format (EMF) log lines, which CloudWatch
+// Logs turns into real metrics with no agent. Also keeps process counters for
+// the plain-text /metrics endpoint.
 function createMetrics({ config }) {
   const lifetime = { requests: 0, errors: 0, latencySum: 0, maxLatencyMs: 0 };
   let buffer = { requests: 0, errors: 0, latency: [] };

@@ -1,8 +1,5 @@
-/* ---------------------------------------------------------------------------
-   Application Load Balancer with two target groups and a weighted default rule.
-   The weights are the canary control knob: scripts/canary-deploy.sh shifts them
-   from 100/0 to 0/100 one step at a time.
-   --------------------------------------------------------------------------- */
+# ALB with two target groups and a weighted default rule. scripts/canary-deploy.sh
+# shifts the weights from 100/0 to 0/100 one step at a time.
 
 resource "aws_lb" "this" {
   name = "${local.name}-alb"
@@ -24,7 +21,7 @@ resource "aws_lb_target_group" "stable" {
   port        = var.container_port
   protocol    = "HTTP"
   vpc_id      = local.vpc_id
-  target_type = "ip" # awsvpc networking registers task ENIs by IP
+  target_type = "ip"
 
   deregistration_delay = var.deregistration_delay
 
@@ -100,17 +97,14 @@ resource "aws_lb_listener" "http" {
     }
   }
 
-  # The canary scripts own the weights at runtime. Without this, every
-  # `terraform apply` mid rollout would snap traffic back to 100/0.
+  # The canary scripts own the weights at runtime; otherwise a mid-rollout
+  # `terraform apply` would snap traffic back to 100/0.
   lifecycle {
     ignore_changes = [default_action]
   }
 }
 
-/* ---------------------------------------------------------------------------
-   Forced routing rules. They let you inspect a single version without touching
-   the weights, which is how the dashboard's "ver solo esta versión" links work.
-   --------------------------------------------------------------------------- */
+# Forced routing rules, used by the dashboard's "ver solo esta versión" links.
 
 resource "aws_lb_listener_rule" "force_canary_query" {
   listener_arn = aws_lb_listener.http.arn

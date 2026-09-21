@@ -1,6 +1,4 @@
-/* ---------------------------------------------------------------------------
-   Security groups — the only network resources this stack owns.
-   --------------------------------------------------------------------------- */
+# Security groups — the only network resources this stack owns.
 
 resource "aws_security_group" "alb" {
   name        = "${local.name}-alb"
@@ -14,8 +12,8 @@ resource "aws_security_group" "alb" {
   }
 }
 
-# The dashboard is a public demo page with no authentication in front of it.
-# Narrow allowed_ingress_cidrs to your own address for anything long lived.
+# Public demo page, no auth in front. Narrow allowed_ingress_cidrs to your own
+# address for anything long lived.
 resource "aws_vpc_security_group_ingress_rule" "alb_http" {
   for_each = toset(var.allowed_ingress_cidrs)
 
@@ -57,8 +55,6 @@ resource "aws_vpc_security_group_ingress_rule" "tasks_from_alb" {
   ip_protocol                  = "tcp"
 }
 
-# Tasks need outbound access to pull from ECR and reach DynamoDB, CloudWatch and
-# the ECS control plane.
 #trivy:ignore:AWS-0104 the created VPC has no NAT/VPC endpoints, so tasks reach AWS APIs and the image registry over the public internet. Use VPC endpoints and scope this down if you deploy into a VPC with private subnets.
 resource "aws_vpc_security_group_egress_rule" "tasks_all" {
   security_group_id = aws_security_group.tasks.id

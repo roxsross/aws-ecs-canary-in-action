@@ -1,22 +1,12 @@
-/* ---------------------------------------------------------------------------
-   Network: created by default, or referenced when you already have one.
-
-   Leave vpc_id empty and Terraform creates a minimal VPC just for this lab:
-   public subnets across vpc_az_count availability zones, an internet gateway
-   and the routes to reach it. Nothing fancy — no NAT, no private subnets — this
-   is meant to be disposable.
-
-   Set vpc_id (and public_subnet_ids) to skip all of that and plug into a VPC
-   you already have. Either way, everything downstream reads local.vpc_id and
-   local.public_subnet_ids, so the rest of the stack does not care which path
-   was taken.
-   --------------------------------------------------------------------------- */
+# Network: created by default, or referenced when vpc_id is set. Either way,
+# the rest of the stack reads local.vpc_id / local.public_subnet_ids and does
+# not care which path was taken.
 
 locals {
   create_vpc = var.vpc_id == ""
 }
 
-# ---------------------------------------------------------------- created path
+# ---- created path ----
 
 data "aws_availability_zones" "available" {
   count = local.create_vpc ? 1 : 0
@@ -73,9 +63,8 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public[0].id
 }
 
-# -------------------------------------------------------------- existing path
+# ---- existing path ----
 
-# Referenced (not created) so a wrong id fails fast with a clear message.
 data "aws_vpc" "existing" {
   count = local.create_vpc ? 0 : 1
   id    = var.vpc_id
@@ -86,7 +75,7 @@ data "aws_subnet" "existing_public" {
   id       = each.value
 }
 
-# ------------------------------------------------------------ unified outputs
+# ---- unified outputs ----
 
 locals {
   vpc_id = local.create_vpc ? aws_vpc.created[0].id : data.aws_vpc.existing[0].id

@@ -1,8 +1,5 @@
-/* ===========================================================================
-   ECS Canary in Action — dashboard client
-   Sends its own probes to /api/hit, so the split you see is real traffic
-   going through the ALB weighted target groups, not a simulation.
-   =========================================================================== */
+// ECS Canary in Action — dashboard client. Sends its own probes to /api/hit,
+// so the split shown is real traffic through the ALB, not a simulation.
 'use strict';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -92,8 +89,6 @@ const state = {
   statsFailures: 0,
 };
 
-/* ------------------------------------------------------------------ helpers */
-
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 const pct = (value) => `${Number(value || 0).toFixed(value >= 10 || value === 0 ? 0 : 1)}%`;
 const nf = new Intl.NumberFormat('es-ES');
@@ -149,8 +144,6 @@ async function api(path, init = {}) {
   }
   return body;
 }
-
-/* -------------------------------------------------------------- probe engine */
 
 let probeTimer = null;
 let renderQueued = false;
@@ -225,8 +218,6 @@ function scheduleProbes() {
     if (state.inFlight < MAX_INFLIGHT) probe();
   }, interval);
 }
-
-/* ----------------------------------------------------------------- renderers */
 
 function setBar(barEl, stablePercent, canaryPercent) {
   if (!barEl) return;
@@ -687,8 +678,6 @@ function renderAll() {
   renderObserved();
 }
 
-/* ---------------------------------------------------------------- data loops */
-
 async function loadStats() {
   try {
     state.stats = await api(`/api/stats?minutes=${WINDOW_MINUTES}&recent=40`);
@@ -715,8 +704,6 @@ async function loadConfig() {
   state.config = await api('/api/config');
   renderIdentity();
 }
-
-/* ------------------------------------------------------------------ controls */
 
 function setPin(pin) {
   state.settings.pin = pin;
@@ -858,8 +845,6 @@ function wireControls() {
     }
   });
 }
-
-/* ---------------------------------------------------------------------- boot */
 
 async function boot() {
   wireControls();

@@ -2,11 +2,8 @@
 
 const os = require('node:os');
 
-/**
- * Reads the ECS task metadata endpoint (v4) so the dashboard can show which
- * Fargate task answered each request. Falls back to the hostname when running
- * locally or in plain Docker.
- */
+// Reads the ECS task metadata endpoint (v4) so the dashboard can show which
+// Fargate task answered each request. Falls back to hostname locally.
 const identity = {
   taskId: os.hostname(),
   taskArn: null,
@@ -38,7 +35,7 @@ function shortTaskId(taskArn) {
   return parts[parts.length - 1] || null;
 }
 
-/** Resolves once (best effort). Retries a few times because the endpoint can lag at boot. */
+// Best effort, retries a few times because the endpoint can lag at boot.
 async function loadIdentity({ attempts = 3, delayMs = 1500 } = {}) {
   const base = process.env.ECS_CONTAINER_METADATA_URI_V4 || process.env.ECS_CONTAINER_METADATA_URI;
   if (!base) return identity;
@@ -74,7 +71,6 @@ async function loadIdentity({ attempts = 3, delayMs = 1500 } = {}) {
   return identity;
 }
 
-/** Short, display friendly task id (last 8 chars). */
 function displayTaskId() {
   const id = identity.taskId || 'unknown';
   return id.length > 10 ? id.slice(-10) : id;

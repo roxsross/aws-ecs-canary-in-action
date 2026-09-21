@@ -1,12 +1,8 @@
 'use strict';
 
-/**
- * Reads the *configured* traffic split straight from the ALB listener so the
- * dashboard can compare intent (weights) against reality (observed hits).
- *
- * Optional: needs LISTENER_ARN plus elasticloadbalancing:DescribeRules. Without
- * it the dashboard simply shows the observed split only.
- */
+// Reads the configured traffic split from the ALB listener, so the dashboard
+// can compare intent (weights) against reality (observed hits). Optional:
+// needs LISTENER_ARN plus elasticloadbalancing:DescribeRules.
 function createWeightsReader({ config }) {
   const enabled = Boolean(
     config.listenerArn && config.stableTargetGroupArn && config.canaryTargetGroupArn,
@@ -28,7 +24,6 @@ function createWeightsReader({ config }) {
 
   function lazyClient() {
     if (client) return client;
-    // Required lazily so the app still boots if the SDK package is absent.
     // eslint-disable-next-line global-require
     const sdk = require('@aws-sdk/client-elastic-load-balancing-v2');
     DescribeRulesCommand = sdk.DescribeRulesCommand;

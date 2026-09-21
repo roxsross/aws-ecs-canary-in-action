@@ -5,7 +5,13 @@ despliega funciona además como **monitor de tráfico en vivo**: en el navegador
 ves cómo se reparten las peticiones entre la versión estable y la canary,
 mientras movés los pesos del balanceador.
 
-![CI](https://github.com/roxsross/aws-ecs-canary-in-action/actions/workflows/ci.yml/badge.svg)
+[![CI](https://github.com/roxsross/aws-ecs-canary-in-action/actions/workflows/ci.yml/badge.svg)](https://github.com/roxsross/aws-ecs-canary-in-action/actions/workflows/ci.yml)
+[![Infrastructure (Terraform)](https://github.com/roxsross/aws-ecs-canary-in-action/actions/workflows/infra-terraform.yml/badge.svg)](https://github.com/roxsross/aws-ecs-canary-in-action/actions/workflows/infra-terraform.yml)
+[![Terraform](https://img.shields.io/badge/terraform-%3E%3D1.6-844FBA?logo=terraform&logoColor=white)](infra/terraform)
+[![Node](https://img.shields.io/badge/node-%3E%3D20-339933?logo=node.js&logoColor=white)](app/package.json)
+[![AWS ECS Fargate](https://img.shields.io/badge/AWS-ECS%20Fargate-FF9900?logo=amazonaws&logoColor=white)](infra/terraform)
+[![Security scan](https://img.shields.io/badge/security-trivy-1904DA?logo=trivy&logoColor=white)](https://trivy.dev)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ```
 BUILD · DEPLOY · EVOLVE
@@ -275,28 +281,96 @@ Cada script acepta `--help`.
 
 ---
 
-## Qué se prueba
+## Pruebas: cómo correrlas y dónde ver el resultado
 
-**`app/scripts/smoke.js`** — corre contra cualquier instancia de la app (local o
-en un contenedor) y verifica: `/api/health`, `/api/config`, que `/api/hit`
-registre tráfico e identifique la versión, que `/api/stats` agregue los
-contadores, un ciclo completo de inyección de fallos (falla al 100% y se
-recupera), `/metrics` y que el dashboard se sirva.
+Hay tres niveles, del más rápido al más completo. Los tres corren en CI en
+cada push/PR; podés correr cada uno localmente antes de subir un cambio.
 
-**`.github/workflows/ci.yml`**, en cada push y PR, sin credenciales de AWS:
+### 1. Lint y validación estática
 
-- `lint`: sintaxis de JS, shellcheck, `terraform fmt`/`validate`, Trivy.
-- `container`: construye la imagen real, la corre, espera que reporte sana y le
-  corre el smoke test.
-- `integration`, el flujo canary completo contra el laboratorio local:
-  - ambas versiones responden cuando se las direcciona explícitamente;
-  - al 100/0 todo el tráfico va a la estable, cero errores;
-  - al 50/50 la distribución observada cae entre 30% y 70% de canary;
-  - inyectar fallos en la canary produce 5xx solo ahí, la estable no se afecta;
-  - una canary marcada `unhealthy` sale de rotación **y el servicio sigue
-    respondiendo al 100% desde la estable**, que es la propiedad de seguridad
-    que todo este laboratorio demuestra;
-  - limpiar la inyección de fallos recupera la canary.
+```bash
+make lint          # todo junto
+make lint-js        # sintaxis de los .js de app/ y local/
+make lint-sh        # shellcheck + bash -n en scripts/*.sh
+make lint-tf        # terraform fmt -check y terraform validate
+make lint-trivy     # Trivy contra infra/terraform, falla si hay HIGH/CRITICAL
+```
+
+Salida esperada: cada paso imprime `ok` o el detalle del error con archivo y
+línea. `make lint-tf` termina con `Success! The configuration is valid.` si
+Terraform está bien formado; `make lint-trivy` imprime una tabla por archivo
+con la cantidad de hallazgos (`0` = limpio).
+
+### 2. Smoke test de la aplicación
+
+Prueba end-to-end contra una instancia real de la app (local, en Docker o en
+Fargate): salud, `/api/hit`, agregación de `/api/stats`, un ciclo de inyección
+de fallos, `/metrics` y que el dashboard se sirva.
+
+```bash
+# contra `make dev` o `make local`
+make smoke
+# o apuntando a cualquier URL, por ejemplo el ALB real:
+make smoke BASE_URL=http://$ALB
+```
+
+Salida esperada, línea por línea (`ok` o `FAIL` por cada chequeo) y un resumen
+final:
+
+```
+smoke testing http://localhost:8080
+  ok   GET /api/health returns 200 — track=stable version=1.0.0
+  ok   GET /api/config exposes palette and tracks — persistence=memory
+  ok   GET /api/hit records traffic and identifies the track — x-track=stable seq=1
+  ok   GET /api/stats aggregates the hit — hits=1 series=5 buckets
+  ok   chaos round trip (fail 100% then clear) — injected 500 and recovered
+  ok   GET /metrics serves prometheus text — exposition format ok
+  ok   GET / serves the dashboard — dashboard html ok
+7/7 checks passed
+```
+
+Un `FAIL` no interrumpe los demás chequeos; al final el proceso termina con
+código de salida distinto de cero si hubo al menos uno, así que sirve para CI
+y para uso manual por igual.
+
+### 3. Integración del flujo canary completo (sin AWS)
+
+Es el mismo laboratorio local (`make local`), pero automatizado: sube el
+mini-ALB + ambas versiones + DynamoDB local, y verifica el comportamiento con
+tráfico real en cada paso.
+
+```bash
+make local
+./scripts/weights.sh --target local --stable 100 --canary 0
+./scripts/traffic-gen.sh --url http://localhost:8080 --requests 60 --concurrency 6 --json
+./scripts/weights.sh --target local --canary 50
+./scripts/traffic-gen.sh --url http://localhost:8080 --requests 200 --concurrency 8 --json
+./scripts/chaos.sh --url http://localhost:8080 --track canary --fail-rate 100
+./scripts/chaos.sh --url http://localhost:8080 --clear
+make local-down
+```
+
+`traffic-gen.sh --json` imprime un resumen (`stable`, `canary`, `errors`,
+`observedCanaryPercent`) que es lo que se compara contra el rango esperado
+(por ejemplo, 50/50 de peso debería caer entre 30% y 70% observado).
+
+### Ver los resultados en GitHub Actions
+
+Los tres niveles corren automáticamente en el workflow **CI**
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) en cada push y pull
+request, sin credenciales de AWS:
+
+- **`lint`**: sintaxis de JS, shellcheck, `terraform fmt`/`validate`, Trivy.
+- **`container`**: construye la imagen real, la corre, espera que reporte sana
+  y le corre el smoke test.
+- **`integration`**: el flujo canary completo contra el laboratorio local
+  (los mismos pasos de arriba, con aserciones automáticas).
+
+Para ver el resultado: pestaña **Actions** del repo → el run correspondiente →
+cada job muestra sus pasos expandibles con el log completo. El badge de CI al
+principio de este README refleja el estado del último run en `main`. Los pasos
+de Terraform (`fmt`, `validate`, `plan`) además escriben un resumen legible en
+el **Job Summary** de cada ejecución, con el plan completo cuando aplica.
 
 ---
 
@@ -367,15 +441,72 @@ aws logs tail /ecs/canary-lab --since 15m --follow
 
 ## Estructura
 
+Dos piezas independientes —**aplicación** e **infraestructura**— más los
+scripts que las conectan en un flujo de canary real.
+
 ```
-app/                  la aplicación y el dashboard (Node, sin build step)
-  src/                servidor, store de DynamoDB, inyección de fallos, métricas EMF
-  public/             dashboard: HTML, CSS y JS a mano, sin dependencias
-infra/terraform/       la infraestructura
-scripts/              el flujo canary: weights, canary-deploy, rollback, chaos...
-local/                laboratorio sin AWS: mini-alb + docker compose
-docs/                 arquitectura a fondo y runbook de operación
-.github/workflows/    CI y CD
+aws-ecs-canary-in-action/
+├── app/                        Aplicación Node.js (Express) — el dashboard y su API
+│   ├── src/
+│   │   ├── server.js           rutas HTTP: /api/health, /api/hit, /api/stats, /api/chaos, /metrics
+│   │   ├── config.js           lectura de env vars, paleta de colores por track
+│   │   ├── metrics.js          métricas EMF para CloudWatch + endpoint prometheus
+│   │   ├── chaos.js            motor de inyección de fallos (fail rate, latencia, unhealthy)
+│   │   ├── alb-weights.js      lee los pesos reales del listener del ALB
+│   │   ├── ecs-metadata.js     identifica en qué tarea Fargate corre cada request
+│   │   └── store/              persistencia: DynamoDB con fallback en memoria
+│   │       ├── dynamo.js       tabla única compartida por todas las tareas
+│   │       ├── memory.js       contadores locales (modo local / degradado)
+│   │       ├── util.js         helpers compartidos (series, agregados, chaos state)
+│   │       └── index.js        selecciona el store según config, expone getSnapshot()
+│   ├── public/                 dashboard estático: HTML + CSS + JS sin build step ni framework
+│   ├── scripts/smoke.js        suite de pruebas end-to-end contra una instancia corriendo
+│   ├── Dockerfile              imagen de producción (multi-stage, non-root)
+│   └── package.json
+│
+├── infra/terraform/            Infraestructura como código (AWS)
+│   ├── main.tf                 locals compartidos: nombres, tags, imagen del contenedor
+│   ├── versions.tf             providers y versión mínima de Terraform
+│   ├── variables.tf            todas las variables de entrada, documentadas y con validación
+│   ├── vpc.tf                  red: crea una VPC mínima o referencia una existente
+│   ├── network.tf              security groups (ALB y tareas)
+│   ├── alb.tf                  Application Load Balancer, target groups, listener con pesos
+│   ├── ecs.tf                  cluster, task definitions y servicios (stable + canary)
+│   ├── ecr.tf                  repositorio de imágenes (opcional, on/off por variable)
+│   ├── dynamodb.tf              tabla de contadores de tráfico
+│   ├── iam.tf                  roles de ejecución y de tarea, con permisos mínimos
+│   ├── monitoring.tf            alarmas CloudWatch + dashboard con el % de tráfico canary
+│   ├── outputs.tf               URLs del dashboard, contrato canary_env para los scripts
+│   └── terraform.tfvars.example
+│
+├── scripts/                    El flujo canary, cada uno con --help
+│   ├── build-push.sh            build + push de la imagen a ECR
+│   ├── load-env.sh              terraform output -> .canary.env
+│   ├── discover-vpc.sh          lista VPCs/subnets existentes para usar en tfvars
+│   ├── weights.sh                lee o cambia los pesos del listener
+│   ├── canary-deploy.sh          rollout progresivo con bake time y rollback automático
+│   ├── promote.sh                promueve la canary a estable
+│   ├── rollback.sh               todo el tráfico de vuelta a estable, ya
+│   ├── chaos.sh                  inyecta o limpia fallos en una versión
+│   ├── traffic-gen.sh            genera carga y reporta el split observado
+│   ├── status.sh                  estado consolidado: split, servicios, targets, alarmas
+│   └── lib.sh                    helpers compartidos (logging, parseo de --help)
+│
+├── local/                      Laboratorio sin cuenta de AWS
+│   ├── docker-compose.yml       mini-alb + app estable + app canary + dynamodb-local
+│   └── mini-alb/server.js       balanceador de juguete: pesos, routing forzado, health checks
+│
+├── docs/
+│   ├── architecture.md          arquitectura a fondo, decisiones de diseño
+│   └── canary-playbook.md       runbook operativo paso a paso
+│
+├── .github/workflows/
+│   ├── ci.yml                    lint + build de imagen + integración local, en cada PR
+│   ├── infra-terraform.yml       fmt/validate/plan (y apply manual) de Terraform
+│   ├── deploy-canary.yml         build, push y rollout progresivo contra AWS real
+│   └── rollback.yml              rollback manual disparable desde GitHub Actions
+│
+└── Makefile                    todos los comandos anteriores, con `make help`
 ```
 
 Más detalle en [docs/architecture.md](docs/architecture.md) y el runbook en

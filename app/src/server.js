@@ -27,7 +27,6 @@ function log(entry) {
   process.stdout.write(`${JSON.stringify({ time: new Date().toISOString(), ...entry })}\n`);
 }
 
-/** Every response carries the identity of the task that produced it. */
 app.use((req, res, next) => {
   res.set('X-Track', config.track);
   res.set('X-Version', config.version);
@@ -68,7 +67,6 @@ function identitySnapshot() {
   };
 }
 
-// ---------------------------------------------------------------- health check
 app.get('/api/health', (req, res) => {
   const unhealthy = chaos.isUnhealthy();
   const status = runtime.draining || unhealthy ? 503 : 200;
@@ -86,7 +84,6 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// ------------------------------------------------------------------- identity
 app.get('/api/whoami', (req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({
@@ -97,7 +94,6 @@ app.get('/api/whoami', (req, res) => {
   });
 });
 
-/** Bootstrap payload for the dashboard. */
 app.get('/api/config', (req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({
@@ -113,7 +109,6 @@ app.get('/api/config', (req, res) => {
   });
 });
 
-// ------------------------------------------------------- the traffic endpoint
 app.all('/api/hit', async (req, res) => {
   const startedAt = process.hrtime.bigint();
   const injectedLatencyMs = await chaos.applyLatency();
@@ -151,7 +146,6 @@ app.all('/api/hit', async (req, res) => {
   });
 });
 
-// ------------------------------------------------------------------ analytics
 app.get('/api/stats', async (req, res) => {
   const minutes = Math.min(Math.max(Number.parseInt(req.query.minutes, 10) || 15, 1), 120);
   const recent = Math.min(Math.max(Number.parseInt(req.query.recent, 10) || 40, 0), 100);
@@ -183,7 +177,6 @@ app.post('/api/reset', requireAdmin, async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------- fault injection
 app.get('/api/chaos', async (req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({ ok: true, chaos: await store.getChaos(), effective: chaos.current() });
@@ -223,13 +216,11 @@ app.delete('/api/chaos', requireAdmin, async (req, res) => {
   }
 });
 
-// -------------------------------------------------------------------- metrics
 app.get('/metrics', (req, res) => {
   res.set('Content-Type', 'text/plain; version=0.0.4');
   res.send(metrics.prometheus());
 });
 
-// ------------------------------------------------------------------ dashboard
 app.use(
   express.static(path.join(__dirname, '..', 'public'), {
     index: 'index.html',
@@ -279,7 +270,6 @@ async function start() {
     shuttingDown = true;
     runtime.draining = true;
     log({ level: 'info', msg: 'draining before shutdown', signal, graceMs: config.shutdownGraceMs });
-    // Keep answering real traffic while the load balancer drains this target.
     setTimeout(() => {
       metrics.stop();
       store.stop();

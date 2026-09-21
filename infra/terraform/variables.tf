@@ -1,6 +1,4 @@
-/* ---------------------------------------------------------------------------
-   General
-   --------------------------------------------------------------------------- */
+# ---- General ----
 
 variable "aws_region" {
   description = "Region where the lab is deployed. Must match the region of the existing VPC."
@@ -25,13 +23,9 @@ variable "tags" {
   default     = {}
 }
 
-/* ---------------------------------------------------------------------------
-   Network — either create a small VPC for the lab, or plug into one you
-   already have. This is the one on/off switch that decides which:
-
-     vpc_id left empty (the default)  -> a minimal VPC is created for you
-     vpc_id set to an existing VPC    -> nothing network related is created
-   --------------------------------------------------------------------------- */
+# ---- Network ----
+# vpc_id empty (default) -> Terraform creates a minimal VPC.
+# vpc_id set              -> nothing network related is created.
 
 variable "vpc_id" {
   description = "ID of an existing VPC to deploy into. Leave empty (the default) to have Terraform create a small VPC for the lab."
@@ -90,9 +84,7 @@ variable "allowed_ingress_cidrs" {
   default     = ["0.0.0.0/0"]
 }
 
-/* ---------------------------------------------------------------------------
-   Container image
-   --------------------------------------------------------------------------- */
+# ---- Container image ----
 
 variable "ecr_repository_name" {
   description = "ECR repository holding the app image. Defaults to <project_name>-app."
@@ -124,9 +116,7 @@ variable "container_port" {
   default     = 8080
 }
 
-/* ---------------------------------------------------------------------------
-   ECS sizing
-   --------------------------------------------------------------------------- */
+# ---- ECS sizing ----
 
 variable "task_cpu" {
   description = "Fargate CPU units per task."
@@ -181,9 +171,7 @@ variable "enable_execute_command" {
   default     = true
 }
 
-/* ---------------------------------------------------------------------------
-   Load balancer behaviour
-   --------------------------------------------------------------------------- */
+# ---- Load balancer behaviour ----
 
 variable "deregistration_delay" {
   description = "Seconds the ALB keeps draining a removed target. Low on purpose so rollbacks feel instant."
@@ -221,9 +209,7 @@ variable "enable_deletion_protection" {
   default     = false
 }
 
-/* ---------------------------------------------------------------------------
-   Observability and alarms — these are what trigger the automatic rollback
-   --------------------------------------------------------------------------- */
+# ---- Observability and alarms (trigger the automatic rollback) ----
 
 variable "log_retention_days" {
   description = "CloudWatch Logs retention for the app log group."
@@ -285,9 +271,7 @@ variable "alarm_sns_topic_arns" {
   default     = []
 }
 
-/* ---------------------------------------------------------------------------
-   App configuration
-   --------------------------------------------------------------------------- */
+# ---- App configuration ----
 
 variable "grant_listener_read" {
   description = "Allow tasks to read the listener rules so the dashboard can show the real configured weights."

@@ -1,7 +1,4 @@
-/* ---------------------------------------------------------------------------
-   The canary_env output is the contract every script and workflow reads.
-   `scripts/load-env.sh terraform` turns it into .canary.env.
-   --------------------------------------------------------------------------- */
+# canary_env is the contract scripts/load-env.sh reads to produce .canary.env.
 
 output "app_url" {
   description = "Open this to get the live traffic dashboard."

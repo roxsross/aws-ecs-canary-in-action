@@ -4,14 +4,9 @@ const { createMemoryStore } = require('./memory');
 const { createDynamoStore } = require('./dynamo');
 const { summarise } = require('./util');
 
-/**
- * Builds the store the app will use.
- *
- * With a table configured we keep a *shadow* in-memory store alongside DynamoDB:
- * every hit is recorded in both, so if the table is throttled, missing or the
- * task lacks IAM permissions the dashboard degrades to per task counters instead
- * of going blank mid demo.
- */
+// With a table configured, keeps a shadow in-memory store alongside DynamoDB:
+// every hit is recorded in both, so a throttled/missing table degrades to per
+// task counters instead of going blank mid demo.
 function createStore(config) {
   const shadow = createMemoryStore({ reason: 'shadow copy of DynamoDB writes' });
 
@@ -101,7 +96,6 @@ function createStore(config) {
   return decorate(composite, shadow, config);
 }
 
-/** Adds the composed read used by /api/stats. */
 function decorate(store, shadow, config) {
   store.getSnapshot = async ({ minutes = 15, recent = 40 } = {}) => {
     const [aggregates, series, recentHits, chaos] = await Promise.all([

@@ -27,16 +27,11 @@ const MINUTE_KEY_WIDTH = 12;
 const MS_KEY_WIDTH = 15;
 const ERROR_LOG_THROTTLE_MS = 30_000;
 
-/**
- * Single table DynamoDB store shared by every task of every track. This is what
- * makes the dashboard show a *global* view of the canary rollout instead of one
- * container's private counters.
- *
- *   pk=AGG    sk=<track>#<version>     rolling counters per track+version
- *   pk=TS     sk=<minute>#<track>      per minute buckets for the timeline chart
- *   pk=HIT    sk=<epochMs>#<rand>      recent request feed (TTL)
- *   pk=CHAOS  sk=<track>               fault injection state, polled by all tasks
- */
+// Single table shared by every task of every track:
+//   pk=AGG    sk=<track>#<version>   rolling counters per track+version
+//   pk=TS     sk=<minute>#<track>    per minute buckets for the timeline chart
+//   pk=HIT    sk=<epochMs>#<rand>    recent request feed (TTL)
+//   pk=CHAOS  sk=<track>             fault injection state, polled by all tasks
 function createDynamoStore(options) {
   const {
     tableName,
@@ -101,11 +96,8 @@ function createDynamoStore(options) {
 
   const ttl = (seconds) => Math.floor(Date.now() / 1000) + seconds;
 
-  /**
-   * Only used when pointing at dynamodb-local, so `docker compose up` just works
-   * regardless of container start order. Retries because the Java process takes a
-   * moment to accept connections.
-   */
+  // Only used against dynamodb-local. Retries since the Java process takes a
+  // moment to accept connections.
   async function ensureLocalTable({ attempts = 8, delayMs = 2500 } = {}) {
     if (!endpoint) return;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {

@@ -1,14 +1,12 @@
-/* ---------------------------------------------------------------------------
-   One cluster, two services: stable and canary. Same image contract, different
-   TRACK and APP_VERSION, each wired to its own target group.
-   --------------------------------------------------------------------------- */
+# One cluster, two services: stable and canary. Same image contract, different
+# TRACK and APP_VERSION, each wired to its own target group.
 
 resource "aws_ecs_cluster" "this" {
   name = local.name
 
   setting {
     name  = "containerInsights"
-    value = "disabled" # keeps the lab cheap; switch to enhanced if you want per task metrics
+    value = "disabled"
   }
 
   tags = { Name = local.name }
@@ -64,9 +62,7 @@ resource "aws_ecs_task_definition" "track" {
 
   runtime_platform {
     operating_system_family = "LINUX"
-    # Must match how the image was built. scripts/build-push.sh defaults to
-    # linux/amd64 so images built on Apple silicon still run here.
-    cpu_architecture = var.cpu_architecture
+    cpu_architecture        = var.cpu_architecture
   }
 
   container_definitions = jsonencode([
@@ -93,9 +89,8 @@ resource "aws_ecs_task_definition" "track" {
         ],
       )
 
-      # Deliberately no container healthCheck: the target group health check is
-      # what drives the alarms and the rollback decision. A container level check
-      # would kill a misbehaving task before the alarm had a chance to fire.
+      # No container healthCheck on purpose: the target group health check is
+      # what drives the alarms and the rollback decision.
 
       logConfiguration = {
         logDriver = "awslogs"
@@ -106,7 +101,7 @@ resource "aws_ecs_task_definition" "track" {
         }
       }
 
-      stopTimeout = 20 # room for the app's graceful drain
+      stopTimeout = 20
     },
   ])
 
@@ -127,8 +122,8 @@ resource "aws_ecs_service" "track" {
   enable_execute_command = var.enable_execute_command
   propagate_tags         = "SERVICE"
 
-  # Deployments *within* a track are plain rolling updates; the canary behaviour
-  # comes from the listener weights, not from the service deployment controller.
+  # Deployments within a track are plain rolling updates; canary behaviour
+  # comes from the listener weights, not the service deployment controller.
   deployment_minimum_healthy_percent = 100
   deployment_maximum_percent         = 200
 
@@ -151,7 +146,7 @@ resource "aws_ecs_service" "track" {
 
   health_check_grace_period_seconds = 60
 
-  # scripts/canary-deploy.sh drives these two at runtime.
+  # scripts/canary-deploy.sh drives these at runtime.
   lifecycle {
     ignore_changes = [desired_count, task_definition]
   }

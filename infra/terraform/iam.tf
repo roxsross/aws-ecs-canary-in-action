@@ -1,8 +1,5 @@
-/* ---------------------------------------------------------------------------
-   Two roles, as ECS expects:
-     execution role — used by the agent to pull the image and write logs
-     task role      — used by the app itself (DynamoDB, listener read)
-   --------------------------------------------------------------------------- */
+# Two roles, as ECS expects: execution role pulls the image and writes logs,
+# task role is used by the app itself (DynamoDB, listener read).
 
 data "aws_iam_policy_document" "ecs_assume_role" {
   statement {
@@ -14,7 +11,6 @@ data "aws_iam_policy_document" "ecs_assume_role" {
       identifiers = ["ecs-tasks.amazonaws.com"]
     }
 
-    # Blocks the confused deputy problem: only this account's tasks may assume it.
     condition {
       test     = "StringEquals"
       variable = "aws:SourceAccount"
@@ -57,9 +53,7 @@ data "aws_iam_policy_document" "task" {
     resources = [aws_dynamodb_table.traffic.arn]
   }
 
-  # Lets the dashboard show the weights actually configured on the listener.
-  # The elasticloadbalancing Describe* actions do not support resource level
-  # permissions, so the resource has to be "*".
+  # elasticloadbalancing Describe* actions don't support resource-level perms.
   dynamic "statement" {
     for_each = var.grant_listener_read ? [1] : []
 

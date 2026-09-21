@@ -1,8 +1,6 @@
-/* ---------------------------------------------------------------------------
-   Alarms scoped to the *canary* target group only. scripts/canary-deploy.sh polls
-   them between traffic steps: any ALARM aborts the rollout and shifts traffic
-   back to stable.
-   --------------------------------------------------------------------------- */
+# Alarms scoped to the canary target group only. scripts/canary-deploy.sh polls
+# them between traffic steps: any ALARM aborts the rollout and shifts traffic
+# back to stable.
 
 resource "aws_cloudwatch_metric_alarm" "canary_5xx" {
   alarm_name        = local.alarm_names.canary_5xx
@@ -22,7 +20,6 @@ resource "aws_cloudwatch_metric_alarm" "canary_5xx" {
   threshold           = var.alarm_5xx_threshold
   comparison_operator = "GreaterThanOrEqualToThreshold"
 
-  # No data means no canary traffic yet, which is not a failure.
   treat_missing_data = "notBreaching"
 
   alarm_actions = var.alarm_sns_topic_arns
@@ -81,9 +78,8 @@ resource "aws_cloudwatch_metric_alarm" "canary_unhealthy" {
   tags = { Name = local.alarm_names.canary_unhealthy, Track = "canary" }
 }
 
-/* Error rate from the app's own embedded metrics (EMF), expressed as a
-   percentage. Catches application level failures that never reach the ALB as
-   5xx, and proves the EMF pipeline works end to end. */
+# Error rate from the app's own embedded metrics (EMF), catches application
+# level failures that never reach the ALB as a 5xx.
 resource "aws_cloudwatch_metric_alarm" "canary_error_rate" {
   count = var.enable_emf_alarm ? 1 : 0
 
@@ -132,9 +128,7 @@ resource "aws_cloudwatch_metric_alarm" "canary_error_rate" {
   tags = { Name = local.alarm_names.canary_error_rate, Track = "canary" }
 }
 
-/* ---------------------------------------------------------------------------
-   Dashboard comparing both tracks side by side.
-   --------------------------------------------------------------------------- */
+# Dashboard comparing both tracks side by side.
 
 resource "aws_cloudwatch_dashboard" "canary" {
   count = var.enable_dashboard ? 1 : 0
@@ -143,11 +137,8 @@ resource "aws_cloudwatch_dashboard" "canary" {
 
   dashboard_body = jsonencode({
     widgets = [
-      # Traffic distribution: the single number that answers "how much traffic
-      # is the canary actually getting right now". Computed with metric math
-      # from raw request counts (stable_requests, canary_requests -> percentage),
-      # so it reflects real traffic through the load balancer, not the weight
-      # configured on the listener (which lives in the ALB, not in CloudWatch).
+      # Canary share of total requests, computed from raw request counts so it
+      # reflects real traffic, not the weight configured on the listener.
       {
         type   = "metric"
         x      = 0
