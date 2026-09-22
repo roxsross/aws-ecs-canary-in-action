@@ -8,8 +8,7 @@ terraform {
     }
   }
 
-  # Local state keeps the lab friction free. For team use, switch to S3 + DynamoDB
-  # locking (or S3 native locking) by uncommenting and running `terraform init -migrate-state`.
+  # Local state by default. For team use, uncomment the S3 backend below.
   #
   # backend "s3" {
   #   bucket       = "my-tfstate-bucket"
