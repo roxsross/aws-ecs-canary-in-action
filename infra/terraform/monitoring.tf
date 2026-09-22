@@ -161,61 +161,66 @@ resource "aws_cloudwatch_dashboard" "canary" {
   dashboard_name = "${local.name}-canary"
 
   dashboard_body = jsonencode({
+    start          = "-PT1H"
+    periodOverride = "inherit"
     widgets = [
-      # Canary share of traffic. MIN/MAX pick canary/stable by request volume
-      # (not by ARN, since roles swap); FILL(...,0) keeps the line continuous;
-      # the right axis overlays real per-APP_VERSION counts.
       {
-        type   = "metric"
+        type   = "text"
         x      = 0
         y      = 0
         width  = 24
+        height = 3
+        properties = {
+          markdown = "## Canary Lab — cómo leer este dashboard\n**Físico vs lógico:** los target groups `primary` y `alternate` rotan de rol en cada deploy (el que hoy es canary mañana es stable). Los widgets *(physical)* muestran el grupo; los *(EMF)* muestran la `APP_VERSION` real y son la fuente de verdad para decidir rollback.\n\n**Limitación del widget \"Canary traffic shift\":** identifica al canary como el grupo con *menos* tráfico. Es correcto mientras `canary_percent <= 50`; en el cutover final (>50 %) el área muestra `100 - x`. Para confirmar quién es quién, usar \"Requests by APP_VERSION\".\n\n**Tasas, no conteos:** con un split 90/10, unos pocos errores en el canary equivalen a muchos más en stable. Comparar siempre con los widgets de *error rate (%)*."
+        }
+      },
+      # Canary share of traffic. MIN/MAX pick canary/stable by request volume
+      # (not by ARN, since roles swap). Valid while canary_percent <= 50.
+      {
+        type   = "metric"
+        x      = 0
+        y      = 3
+        width  = 24
         height = 6
         properties = {
-          title   = "Canary traffic shift: % of requests on the canary revision, by APP_VERSION"
+          title   = "Canary traffic shift: % of requests on the canary revision"
           region  = var.aws_region
           view    = "timeSeries"
           stacked = true
           period  = 60
           stat    = "Sum"
-          yAxis = {
-            left  = { min = 0, max = 100, label = "% of total requests (canary share)" }
-            right = { min = 0, label = "requests / min, by APP_VERSION" }
-          }
+          yAxis   = { left = { min = 0, max = 100, label = "% of total requests (canary share)" } }
           annotations = {
             horizontal = [
               { label = "configured canary_percent", value = var.canary_percent, color = "#94a3b8", yAxis = "left" },
             ]
           }
           metrics = [
-            ["AWS/ApplicationELB", "RequestCount", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix,
-              { id = "primary_requests_raw", visible = false }
-            ],
-            ["AWS/ApplicationELB", "RequestCount", "TargetGroup", aws_lb_target_group.alternate.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix,
-              { id = "alternate_requests_raw", visible = false }
-            ],
-            [{ expression = "FILL(primary_requests_raw, 0)", label = "primary_requests", id = "primary_requests", visible = false }],
-            [{ expression = "FILL(alternate_requests_raw, 0)", label = "alternate_requests", id = "alternate_requests", visible = false }],
-            [{ expression = "MAX([primary_requests, alternate_requests])", label = "stable_requests", id = "stable_requests", visible = false }],
-            [{ expression = "MIN([primary_requests, alternate_requests])", label = "canary_requests", id = "canary_requests", visible = false }],
-            [{ expression = "IF(stable_requests + canary_requests > 0, 100 * canary_requests / (stable_requests + canary_requests), 0)", label = "canary % (filled area) — rest of the axis is the stable revision", id = "canary_pct", color = "#f472b6" }],
-            [{ expression = "SEARCH('{${var.metrics_namespace},Track,Version} MetricName=\"RequestCount\"', 'Sum', 60)", label = "", id = "requestsByVersion", yAxis = "right" }],
+            ["AWS/ApplicationELB", "RequestCount", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { id = "primary_requests_raw", visible = false }],
+            ["AWS/ApplicationELB", "RequestCount", "TargetGroup", aws_lb_target_group.alternate.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { id = "alternate_requests_raw", visible = false }],
+            [{ expression = "FILL(primary_requests_raw, 0)", id = "primary_requests", visible = false }],
+            [{ expression = "FILL(alternate_requests_raw, 0)", id = "alternate_requests", visible = false }],
+            [{ expression = "MAX([primary_requests, alternate_requests])", id = "stable_requests", visible = false }],
+            [{ expression = "MIN([primary_requests, alternate_requests])", id = "canary_requests", visible = false }],
+            [{ expression = "IF(stable_requests + canary_requests > 0, 100 * canary_requests / (stable_requests + canary_requests), 0)", id = "canary_pct", label = "canary share (%) — válido mientras canary <= 50 %", color = "#f472b6" }],
           ]
         }
       },
-      # Per-APP_VERSION view (the one that says which revision is which).
+      # Which APP_VERSION is which — the source of truth for rollback decisions.
       {
         type   = "metric"
         x      = 0
-        y      = 6
+        y      = 9
         width  = 12
         height = 6
         properties = {
-          title  = "Requests by APP_VERSION (EMF)"
-          region = var.aws_region
-          view   = "timeSeries"
-          period = 60
-          stat   = "Sum"
+          title   = "Requests by APP_VERSION (EMF) — quién es canary hoy"
+          region  = var.aws_region
+          view    = "timeSeries"
+          stacked = false
+          period  = 60
+          stat    = "Sum"
+          yAxis   = { left = { min = 0, label = "requests / min" } }
           metrics = [
             [{ expression = "SEARCH('{${var.metrics_namespace},Track,Version} MetricName=\"RequestCount\"', 'Sum', 60)", id = "requestsByVersion" }],
           ]
@@ -224,109 +229,134 @@ resource "aws_cloudwatch_dashboard" "canary" {
       {
         type   = "metric"
         x      = 12
-        y      = 6
+        y      = 9
         width  = 12
         height = 6
         properties = {
-          title  = "Errors by APP_VERSION (EMF)"
+          title  = "Error rate by APP_VERSION (EMF, %)"
           region = var.aws_region
           view   = "timeSeries"
           period = 60
           stat   = "Sum"
+          yAxis  = { left = { min = 0, label = "% of that version's requests" } }
+          annotations = {
+            horizontal = [
+              { label = "error-rate alarm threshold", value = var.alarm_error_rate_threshold, color = "#d62728" },
+            ]
+          }
           metrics = [
-            [{ expression = "SEARCH('{${var.metrics_namespace},Track,Version} MetricName=\"ErrorCount\"', 'Sum', 60)", id = "errorsByVersion", color = "#d62728" }],
+            [{ expression = "SEARCH('{${var.metrics_namespace},Track,Version} MetricName=\"RequestCount\"', 'Sum', 60)", id = "reqV", visible = false }],
+            [{ expression = "SEARCH('{${var.metrics_namespace},Track,Version} MetricName=\"ErrorCount\"', 'Sum', 60)", id = "errV", visible = false }],
+            [{ expression = "IF(reqV > 0, 100 * FILL(errV, 0) / reqV, 0)", id = "errRateV", label = "error rate by version (%)" }],
           ]
         }
       },
-      # Raw physical target groups (stable/canary role swaps between deploys).
+      # Rates, not counts — comparable across an uneven traffic split.
       {
         type   = "metric"
         x      = 0
-        y      = 12
+        y      = 15
         width  = 12
         height = 6
         properties = {
-          title  = "Requests per target group (physical — roles swap per deploy)"
+          title  = "5xx rate per target group (physical, %)"
           region = var.aws_region
           view   = "timeSeries"
           period = 60
           stat   = "Sum"
+          yAxis  = { left = { min = 0, label = "% of that group's requests" } }
+          annotations = {
+            horizontal = [
+              { label = "5xx rate alarm threshold", value = var.alarm_error_rate_threshold, color = "#d62728" },
+            ]
+          }
           metrics = [
-            ["AWS/ApplicationELB", "RequestCount", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { label = "primary" }],
-            ["...", aws_lb_target_group.alternate.arn_suffix, ".", aws_lb.this.arn_suffix, { label = "alternate" }],
+            ["AWS/ApplicationELB", "RequestCount", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { id = "req_p", visible = false }],
+            ["AWS/ApplicationELB", "RequestCount", "TargetGroup", aws_lb_target_group.alternate.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { id = "req_a", visible = false }],
+            ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { id = "err_p", visible = false }],
+            ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "TargetGroup", aws_lb_target_group.alternate.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { id = "err_a", visible = false }],
+            [{ expression = "IF(req_p > 0, 100 * FILL(err_p, 0) / req_p, 0)", id = "rate_p", label = "primary 5xx rate (%)", color = "#1f77b4" }],
+            [{ expression = "IF(req_a > 0, 100 * FILL(err_a, 0) / req_a, 0)", id = "rate_a", label = "alternate 5xx rate (%)", color = "#d62728" }],
           ]
         }
       },
       {
         type   = "metric"
         x      = 12
-        y      = 12
+        y      = 15
         width  = 12
         height = 6
         properties = {
-          title  = "5xx per target group (physical)"
+          title  = "5xx counts: target + ALB-level (physical)"
           region = var.aws_region
           view   = "timeSeries"
           period = 60
           stat   = "Sum"
-          metrics = [
-            ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { label = "primary 5xx" }],
-            ["...", aws_lb_target_group.alternate.arn_suffix, ".", aws_lb.this.arn_suffix, { label = "alternate 5xx", color = "#d62728" }],
-          ]
+          yAxis  = { left = { min = 0 } }
           annotations = {
             horizontal = [
-              { label = "alarm threshold", value = var.alarm_5xx_threshold, color = "#d62728" },
+              { label = "alarm threshold (count)", value = var.alarm_5xx_threshold, color = "#d62728" },
             ]
           }
+          metrics = [
+            ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { label = "primary target 5xx", color = "#1f77b4" }],
+            ["...", aws_lb_target_group.alternate.arn_suffix, ".", aws_lb.this.arn_suffix, { label = "alternate target 5xx", color = "#d62728" }],
+            ["AWS/ApplicationELB", "HTTPCode_ELB_5XX_Count", "LoadBalancer", aws_lb.this.arn_suffix, { label = "ALB-generated 5xx (no target)", color = "#ff7f0e" }],
+            ["AWS/ApplicationELB", "TargetConnectionErrorCount", "LoadBalancer", aws_lb.this.arn_suffix, { label = "target connection errors", color = "#9467bd" }],
+          ]
         }
       },
       {
         type   = "metric"
         x      = 0
-        y      = 18
+        y      = 21
         width  = 12
         height = 6
         properties = {
-          title  = "p95 latency per target group (physical)"
+          title  = "Latency per target group: p50 / p95 / p99 (physical)"
           region = var.aws_region
           view   = "timeSeries"
           period = 60
-          stat   = "p95"
-          metrics = [
-            ["AWS/ApplicationELB", "TargetResponseTime", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { label = "primary p95" }],
-            ["...", aws_lb_target_group.alternate.arn_suffix, ".", aws_lb.this.arn_suffix, { label = "alternate p95", color = "#d62728" }],
-          ]
+          yAxis  = { left = { min = 0, label = "seconds" } }
           annotations = {
             horizontal = [
-              { label = "latency budget", value = var.alarm_latency_threshold_seconds, color = "#d62728" },
+              { label = "latency budget (p95)", value = var.alarm_latency_threshold_seconds, color = "#d62728" },
             ]
           }
+          metrics = [
+            ["AWS/ApplicationELB", "TargetResponseTime", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { stat = "p50", label = "primary p50", color = "#aec7e8" }],
+            ["...", { stat = "p95", label = "primary p95", color = "#1f77b4" }],
+            ["...", { stat = "p99", label = "primary p99", color = "#08306b" }],
+            ["AWS/ApplicationELB", "TargetResponseTime", "TargetGroup", aws_lb_target_group.alternate.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { stat = "p50", label = "alternate p50", color = "#ff9896" }],
+            ["...", { stat = "p95", label = "alternate p95", color = "#d62728" }],
+            ["...", { stat = "p99", label = "alternate p99", color = "#7f0000" }],
+          ]
         }
       },
       {
         type   = "metric"
         x      = 12
-        y      = 18
+        y      = 21
         width  = 12
         height = 6
         properties = {
-          title  = "Healthy targets (physical)"
+          title  = "Healthy / unhealthy targets (physical, min/max per minute)"
           region = var.aws_region
           view   = "timeSeries"
           period = 60
-          stat   = "Average"
+          yAxis  = { left = { min = 0 } }
           metrics = [
-            ["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { label = "primary healthy" }],
-            ["...", aws_lb_target_group.alternate.arn_suffix, ".", aws_lb.this.arn_suffix, { label = "alternate healthy" }],
-            ["AWS/ApplicationELB", "UnHealthyHostCount", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { label = "primary unhealthy", color = "#d62728" }],
-            ["...", aws_lb_target_group.alternate.arn_suffix, ".", aws_lb.this.arn_suffix, { label = "alternate unhealthy", color = "#f472b6" }],
+            ["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { stat = "Minimum", label = "primary healthy (min)", color = "#1f77b4" }],
+            ["...", aws_lb_target_group.alternate.arn_suffix, ".", aws_lb.this.arn_suffix, { stat = "Minimum", label = "alternate healthy (min)", color = "#2ca02c" }],
+            ["AWS/ApplicationELB", "UnHealthyHostCount", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { stat = "Maximum", label = "primary unhealthy (max)", color = "#d62728" }],
+            ["...", aws_lb_target_group.alternate.arn_suffix, ".", aws_lb.this.arn_suffix, { stat = "Maximum", label = "alternate unhealthy (max)", color = "#f472b6" }],
           ]
         }
       },
       {
         type   = "alarm"
         x      = 0
-        y      = 24
+        y      = 27
         width  = 24
         height = 4
         properties = {
