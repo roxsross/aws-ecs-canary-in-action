@@ -71,17 +71,8 @@ data "aws_iam_policy_document" "task" {
     }
   }
 
-  # Lets the app itself read the production listener rule's live weights
-  # (app/src/alb-weights.js), so its dashboard shows the real canary split
-  # ECS is driving instead of falling back to an estimate.
-  #
-  # elasticloadbalancing:DescribeRules is a Describe/List-style action and
-  # does not support resource-level permissions in IAM — confirmed with
-  # `aws iam simulate-principal-policy`, which returned implicitDeny with no
-  # MatchedStatements when this was scoped to a specific rule ARN. It needs
-  # Resource = "*". It's still read-only (no rule modification actions are
-  # granted), so this can only leak the shape of this account's own ALB
-  # rules, not change anything.
+  # Lets the app read the live traffic split (app/src/alb-weights.js).
+  # DescribeRules is read-only and doesn't support resource-level scoping.
   statement {
     sid    = "ReadListenerRules"
     effect = "Allow"
@@ -100,9 +91,7 @@ resource "aws_iam_role_policy" "task" {
   policy = data.aws_iam_policy_document.task.json
 }
 
-# Lets ECS itself create/modify the alternate target group and rewrite the
-# production listener rule's weights during a canary deployment. Without this
-# role, deployment_configuration.strategy = "CANARY" cannot move any traffic.
+# Role ECS assumes to manage target groups and listener rules during rollouts.
 data "aws_iam_policy_document" "ecs_infrastructure_assume_role" {
   statement {
     effect  = "Allow"

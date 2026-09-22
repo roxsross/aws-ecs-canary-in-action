@@ -1,9 +1,6 @@
 # One cluster, one service. Canary behaviour comes from ECS's native
-# deployment_configuration (strategy = CANARY), not from a second service: ECS
-# creates the "green" revision, target group registration and listener rule
-# weighting for you, watches the alarms below, and rolls back on its own if one
-# breaches. See docs/architecture.md for how this replaced the two-service /
-# hand-rolled listener weights design used by local/mini-alb.
+# One service using ECS's native CANARY deployment strategy. ECS owns the green
+# revision, traffic shifting and automatic rollback. See docs/architecture.md.
 
 resource "aws_ecs_cluster" "this" {
   name = local.name
@@ -69,8 +66,7 @@ resource "aws_ecs_task_definition" "app" {
         [{ name = "APP_VERSION", value = var.app_version }],
       )
 
-      # No container healthCheck on purpose: the target group health check is
-      # what drives the alarms and the rollback decision.
+      # No container healthCheck: the target group health check drives rollback.
 
       logConfiguration = {
         logDriver = "awslogs"
@@ -135,9 +131,7 @@ resource "aws_ecs_service" "app" {
     alarm_names = local.rollback_alarm_names
   }
 
-  # A rollout is triggered with `aws ecs update-service --force-new-deployment
-  # --task-definition ...`, not by editing this resource, so Terraform should
-  # not fight the in-flight canary/green revision it created.
+  # Rollouts happen via update-service, so Terraform must not fight them.
   lifecycle {
     ignore_changes = [desired_count, task_definition]
   }

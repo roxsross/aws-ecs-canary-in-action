@@ -1,9 +1,5 @@
-# ALB using ECS's native canary deployment strategy (deployment_configuration
-# in ecs.tf). Two target groups, "primary" (current production revision) and
-# "alternate" (the revision ECS is rolling out); ECS itself moves the listener
-# rule weights during a deployment via load_balancer.advanced_configuration.
-# Terraform only owns the initial 100/0 state and the rule; it does not touch
-# weights afterwards, the same way it never touched them in the old design.
+# ALB with two target groups (primary/alternate). ECS moves the listener rule
+# weights during a deployment; Terraform only sets the initial 100/0 state.
 
 resource "aws_lb" "this" {
   name = "${local.name}-alb"
@@ -86,10 +82,8 @@ resource "aws_lb_listener" "http" {
   }
 }
 
-# ECS requires the production traffic action to live on a listener *rule*, not
-# the listener's own default action, so this is what deployment_configuration
-# points at. ECS rewrites its target group during each deployment; Terraform
-# only sets the initial state.
+# Production traffic must live on a listener rule (not the default action) for
+# ECS to rewrite it during deployments.
 resource "aws_lb_listener_rule" "production" {
   listener_arn = aws_lb_listener.http.arn
   priority     = 1
