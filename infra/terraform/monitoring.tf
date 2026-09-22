@@ -221,8 +221,11 @@ resource "aws_cloudwatch_dashboard" "canary" {
           period  = 60
           stat    = "Sum"
           yAxis   = { left = { min = 0, label = "requests / min" } }
+          # SORT(..., MAX, DESC, 4): SEARCH finds every APP_VERSION ever
+          # emitted, so cap the legend to the 4 with the most traffic in the
+          # window — the currently-serving ones — instead of every retired one.
           metrics = [
-            [{ expression = "SEARCH('{${var.metrics_namespace},Track,Version} MetricName=\"RequestCount\"', 'Sum', 60)", id = "requestsByVersion" }],
+            [{ expression = "SORT(SEARCH('{${var.metrics_namespace},Track,Version} MetricName=\"RequestCount\"', 'Sum', 60), MAX, DESC, 4)", id = "requestsByVersion" }],
           ]
         }
       },
@@ -244,7 +247,7 @@ resource "aws_cloudwatch_dashboard" "canary" {
           stat   = "Sum"
           yAxis  = { left = { min = 0, label = "errors / min" } }
           metrics = [
-            [{ expression = "SEARCH('{${var.metrics_namespace},Track,Version} MetricName=\"ErrorCount\"', 'Sum', 60)", id = "errorsByVersion", color = "#d62728" }],
+            [{ expression = "SORT(SEARCH('{${var.metrics_namespace},Track,Version} MetricName=\"ErrorCount\"', 'Sum', 60), MAX, DESC, 4)", id = "errorsByVersion", color = "#d62728" }],
           ]
         }
       },
