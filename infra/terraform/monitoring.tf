@@ -1,18 +1,37 @@
-# Alarms scoped to the alternate target group: that's where ECS runs the new
-# revision during a canary deployment. aws_ecs_service.app.alarms references
-# these by name, so ECS itself watches them and rolls back automatically —
-# no polling script needed.
+# Alarms mirrored on BOTH target groups, combined with a composite alarm
+# ("ALARM(primary) OR ALARM(alternate)"). Why both, not just one:
+#
+# ECS's canary/blue-green strategy does not keep a fixed physical target
+# group for "the new revision" across deployments - confirmed live against
+# this account by cross-checking running task definitions against target
+# group membership on two separate rollouts. The first rollout put the new
+# revision in the alternate target group; the second put it in primary.
+# A single metric alarm can only watch one fixed dimension value, so an
+# alarm scoped to "alternate" would watch the actual canary every other
+# rollout and watch the *stable* revision the rest of the time - silently
+# useless for its stated job (catching a bad canary) exactly half the time.
+#
+# CloudWatch's math functions (IF, MIN, MAX) can't fix this at the alarm
+# level either: comparing two time series to conditionally pick a third
+# ("whichever target group has less traffic, use *its* 5xx count") isn't
+# expressible in metric math - IF only compares a time series against a
+# scalar, not against another time series. A composite alarm sidesteps the
+# whole problem: watch both target groups unconditionally, and treat a
+# problem on either one as a reason to trigger ECS's automatic rollback.
+# This also means a regression on the stable revision (not just the canary)
+# triggers a rollback too, which is a reasonable thing to want anyway.
+resource "aws_cloudwatch_metric_alarm" "tg_5xx" {
+  for_each = local.target_groups
 
-resource "aws_cloudwatch_metric_alarm" "canary_5xx" {
-  alarm_name        = local.alarm_names.canary_5xx
-  alarm_description = "The new revision (alternate target group) is returning 5xx responses"
+  alarm_name        = "${local.name}-${each.key}-5xx"
+  alarm_description = "The ${each.key} target group is returning 5xx responses"
 
   namespace   = "AWS/ApplicationELB"
   metric_name = "HTTPCode_Target_5XX_Count"
   statistic   = "Sum"
 
   dimensions = {
-    TargetGroup  = aws_lb_target_group.alternate.arn_suffix
+    TargetGroup  = each.value.arn_suffix
     LoadBalancer = aws_lb.this.arn_suffix
   }
 
@@ -23,22 +42,21 @@ resource "aws_cloudwatch_metric_alarm" "canary_5xx" {
 
   treat_missing_data = "notBreaching"
 
-  alarm_actions = var.alarm_sns_topic_arns
-  ok_actions    = var.alarm_sns_topic_arns
-
-  tags = { Name = local.alarm_names.canary_5xx }
+  tags = { Name = "${local.name}-${each.key}-5xx" }
 }
 
-resource "aws_cloudwatch_metric_alarm" "canary_latency" {
-  alarm_name        = local.alarm_names.canary_latency
-  alarm_description = "The new revision's p95 latency is above the agreed budget"
+resource "aws_cloudwatch_metric_alarm" "tg_latency" {
+  for_each = local.target_groups
+
+  alarm_name        = "${local.name}-${each.key}-latency"
+  alarm_description = "The ${each.key} target group's p95 latency is above the agreed budget"
 
   namespace          = "AWS/ApplicationELB"
   metric_name        = "TargetResponseTime"
   extended_statistic = "p95"
 
   dimensions = {
-    TargetGroup  = aws_lb_target_group.alternate.arn_suffix
+    TargetGroup  = each.value.arn_suffix
     LoadBalancer = aws_lb.this.arn_suffix
   }
 
@@ -48,22 +66,21 @@ resource "aws_cloudwatch_metric_alarm" "canary_latency" {
   comparison_operator = "GreaterThanThreshold"
   treat_missing_data  = "notBreaching"
 
-  alarm_actions = var.alarm_sns_topic_arns
-  ok_actions    = var.alarm_sns_topic_arns
-
-  tags = { Name = local.alarm_names.canary_latency }
+  tags = { Name = "${local.name}-${each.key}-latency" }
 }
 
-resource "aws_cloudwatch_metric_alarm" "canary_unhealthy" {
-  alarm_name        = local.alarm_names.canary_unhealthy
-  alarm_description = "The new revision's target group has unhealthy targets"
+resource "aws_cloudwatch_metric_alarm" "tg_unhealthy" {
+  for_each = local.target_groups
+
+  alarm_name        = "${local.name}-${each.key}-unhealthy"
+  alarm_description = "The ${each.key} target group has unhealthy targets"
 
   namespace   = "AWS/ApplicationELB"
   metric_name = "UnHealthyHostCount"
   statistic   = "Maximum"
 
   dimensions = {
-    TargetGroup  = aws_lb_target_group.alternate.arn_suffix
+    TargetGroup  = each.value.arn_suffix
     LoadBalancer = aws_lb.this.arn_suffix
   }
 
@@ -72,6 +89,44 @@ resource "aws_cloudwatch_metric_alarm" "canary_unhealthy" {
   threshold           = 1
   comparison_operator = "GreaterThanOrEqualToThreshold"
   treat_missing_data  = "notBreaching"
+
+  tags = { Name = "${local.name}-${each.key}-unhealthy" }
+}
+
+# One composite alarm per signal, OR-ing the two per-target-group alarms.
+# These (not the per-target-group alarms above) are what
+# aws_ecs_service.app.alarms and the dashboard's alarm widget reference -
+# the per-target-group ones intentionally carry no alarm_actions/ok_actions
+# of their own, so nothing double-fires.
+resource "aws_cloudwatch_composite_alarm" "canary_5xx" {
+  alarm_name        = local.alarm_names.canary_5xx
+  alarm_description = "Either target group is returning 5xx responses"
+
+  alarm_rule = join(" OR ", [for key in keys(local.target_groups) : "ALARM(\"${aws_cloudwatch_metric_alarm.tg_5xx[key].alarm_name}\")"])
+
+  alarm_actions = var.alarm_sns_topic_arns
+  ok_actions    = var.alarm_sns_topic_arns
+
+  tags = { Name = local.alarm_names.canary_5xx }
+}
+
+resource "aws_cloudwatch_composite_alarm" "canary_latency" {
+  alarm_name        = local.alarm_names.canary_latency
+  alarm_description = "Either target group's p95 latency is above the agreed budget"
+
+  alarm_rule = join(" OR ", [for key in keys(local.target_groups) : "ALARM(\"${aws_cloudwatch_metric_alarm.tg_latency[key].alarm_name}\")"])
+
+  alarm_actions = var.alarm_sns_topic_arns
+  ok_actions    = var.alarm_sns_topic_arns
+
+  tags = { Name = local.alarm_names.canary_latency }
+}
+
+resource "aws_cloudwatch_composite_alarm" "canary_unhealthy" {
+  alarm_name        = local.alarm_names.canary_unhealthy
+  alarm_description = "Either target group has unhealthy targets"
+
+  alarm_rule = join(" OR ", [for key in keys(local.target_groups) : "ALARM(\"${aws_cloudwatch_metric_alarm.tg_unhealthy[key].alarm_name}\")"])
 
   alarm_actions = var.alarm_sns_topic_arns
   ok_actions    = var.alarm_sns_topic_arns

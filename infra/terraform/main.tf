@@ -20,6 +20,14 @@ locals {
   service_name   = "${var.project_name}-app"
   task_family    = "${var.project_name}-app"
 
+  # Iterated in monitoring.tf to create one metric alarm per target group per
+  # signal (5xx, latency, unhealthy), since neither target group can be
+  # trusted to always be "the canary" — see the comment above tg_5xx there.
+  target_groups = {
+    primary   = aws_lb_target_group.primary
+    alternate = aws_lb_target_group.alternate
+  }
+
   alarm_names = {
     canary_5xx        = "${var.project_name}-canary-5xx"
     canary_latency    = "${var.project_name}-canary-latency"
@@ -28,12 +36,16 @@ locals {
   }
 
   # The alarm names deployment_configuration.alarms watches for automatic
-  # rollback. Filters out the EMF-based one when it's disabled.
+  # rollback. canary_5xx/latency/unhealthy are composite alarms (OR of the
+  # same signal on both target groups, see monitoring.tf) so a problem on
+  # whichever target group is actually running the canary this deployment
+  # gets caught regardless of which physical target group that turns out to
+  # be. Filters out the EMF-based one when it's disabled.
   rollback_alarm_names = concat(
     [
-      aws_cloudwatch_metric_alarm.canary_5xx.alarm_name,
-      aws_cloudwatch_metric_alarm.canary_latency.alarm_name,
-      aws_cloudwatch_metric_alarm.canary_unhealthy.alarm_name,
+      aws_cloudwatch_composite_alarm.canary_5xx.alarm_name,
+      aws_cloudwatch_composite_alarm.canary_latency.alarm_name,
+      aws_cloudwatch_composite_alarm.canary_unhealthy.alarm_name,
     ],
     var.enable_emf_alarm ? [aws_cloudwatch_metric_alarm.canary_error_rate[0].alarm_name] : [],
   )
@@ -41,9 +53,9 @@ locals {
   # Same alarms, as ARNs, for the CloudWatch dashboard's "alarm" widget.
   rollback_alarm_arns = concat(
     [
-      aws_cloudwatch_metric_alarm.canary_5xx.arn,
-      aws_cloudwatch_metric_alarm.canary_latency.arn,
-      aws_cloudwatch_metric_alarm.canary_unhealthy.arn,
+      aws_cloudwatch_composite_alarm.canary_5xx.arn,
+      aws_cloudwatch_composite_alarm.canary_latency.arn,
+      aws_cloudwatch_composite_alarm.canary_unhealthy.arn,
     ],
     var.enable_emf_alarm ? [aws_cloudwatch_metric_alarm.canary_error_rate[0].arn] : [],
   )
