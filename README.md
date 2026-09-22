@@ -1,10 +1,10 @@
 # ECS Canary in Action
 
-Laboratorio de **despliegues canary en Amazon ECS Fargate**. En AWS real usa la
+Laboratorio de **despliegues canary en Amazon ECS Fargate**. En AWS usa la
 estrategia de canary nativa de ECS (lanzada en 2025): un solo servicio, y ECS
 mismo mueve el tráfico, hornea y revierte si algo sale mal. En local, un
-balanceador de juguete con dos versiones reales enseña el mecanismo de pesos
-paso a paso, sin la orquestación por delante. La app que se despliega funciona
+balanceador de juguete con dos versiones enseña el mecanismo de pesos paso a
+paso, sin la orquestación por delante. La app que se despliega funciona
 además como **monitor de tráfico en vivo**.
 
 [![CI](https://github.com/roxsross/aws-ecs-canary-in-action/actions/workflows/ci.yml/badge.svg)](https://github.com/roxsross/aws-ecs-canary-in-action/actions/workflows/ci.yml)

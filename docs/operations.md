@@ -226,7 +226,7 @@ aws-ecs-canary-in-action/
 ├── .github/workflows/
 │   ├── ci.yml                    lint + build de imagen + integración local, en cada PR
 │   ├── infra-terraform.yml       fmt/validate/plan (y apply manual) de Terraform
-│   ├── deploy-canary.yml         build, push y rollout canary nativo contra AWS real
+│   ├── deploy-canary.yml         build, push y rollout canary nativo contra AWS
 │   └── rollback.yml              rollback manual disparable desde GitHub Actions
 │
 └── Makefile                    todos los comandos anteriores, con `make help`
