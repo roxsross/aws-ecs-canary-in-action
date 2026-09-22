@@ -189,6 +189,9 @@ simular un incidente durante el rollout y ver el rollback automático
 
 ## Seguir leyendo
 
+- **[docs/ejemplo-canary.md](docs/ejemplo-canary.md)** — recorrido guiado de
+  punta a punta: levantar la estable, meter la canary e inyectarle latencia,
+  primero en local y después en AWS con Terraform.
 - **[docs/canary-playbook.md](docs/canary-playbook.md)** — runbook operativo:
   cómo correr y leer un rollout, qué hacer cuando algo sale mal, el guion de una
   demo en vivo, y qué ajustar para producción.

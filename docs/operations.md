@@ -1,6 +1,8 @@
 # Operación: comandos, pruebas y troubleshooting de setup
 
-Referencia de uso diario del laboratorio. Para el diseño técnico ver
+Referencia de uso diario del laboratorio. Para un recorrido completo de punta a
+punta (estable → canary → latencia, en local y en AWS) ver
+[ejemplo-canary.md](ejemplo-canary.md); para el diseño técnico ver
 [architecture.md](architecture.md); para guionar un rollout o un rollback en
 detalle ver [canary-playbook.md](canary-playbook.md).
 
