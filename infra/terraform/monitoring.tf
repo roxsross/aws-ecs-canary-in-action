@@ -226,6 +226,10 @@ resource "aws_cloudwatch_dashboard" "canary" {
           ]
         }
       },
+      # Error COUNT (not rate) by version: SEARCH returns one series per
+      # version, and metric math can't do array-vs-scalar or array/array ops,
+      # so a per-version rate isn't expressible here. Rate lives at the
+      # aggregate level (EMF alarm) and per physical target group (below).
       {
         type   = "metric"
         x      = 12
@@ -233,21 +237,14 @@ resource "aws_cloudwatch_dashboard" "canary" {
         width  = 12
         height = 6
         properties = {
-          title  = "Error rate by APP_VERSION (EMF, %)"
+          title  = "Errors by APP_VERSION (EMF, count)"
           region = var.aws_region
           view   = "timeSeries"
           period = 60
           stat   = "Sum"
-          yAxis  = { left = { min = 0, label = "% of that version's requests" } }
-          annotations = {
-            horizontal = [
-              { label = "error-rate alarm threshold", value = var.alarm_error_rate_threshold, color = "#d62728" },
-            ]
-          }
+          yAxis  = { left = { min = 0, label = "errors / min" } }
           metrics = [
-            [{ expression = "SEARCH('{${var.metrics_namespace},Track,Version} MetricName=\"RequestCount\"', 'Sum', 60)", id = "reqV", visible = false }],
-            [{ expression = "SEARCH('{${var.metrics_namespace},Track,Version} MetricName=\"ErrorCount\"', 'Sum', 60)", id = "errV", visible = false }],
-            [{ expression = "IF(reqV > 0, 100 * FILL(errV, 0) / reqV, 0)", id = "errRateV", label = "error rate by version (%)" }],
+            [{ expression = "SEARCH('{${var.metrics_namespace},Track,Version} MetricName=\"ErrorCount\"', 'Sum', 60)", id = "errorsByVersion", color = "#d62728" }],
           ]
         }
       },

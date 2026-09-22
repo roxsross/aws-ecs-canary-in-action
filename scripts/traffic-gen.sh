@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# Generates traffic and reports the split it actually observed, read from the
-# X-Track response header. Useful as proof: at 5% canary weight, roughly 5% of
-# these requests come back from the canary.
+# Generates traffic and reports the split it actually observed. Useful as
+# proof: at 5% canary weight, roughly 5% of these requests hit the canary.
 #
 #   ./scripts/traffic-gen.sh                                 # 5 rps for 60s
 #   ./scripts/traffic-gen.sh --rps 20 --duration 300
 #   ./scripts/traffic-gen.sh --requests 200                  # a fixed count, as fast as it can
 #   ./scripts/traffic-gen.sh --track canary                  # pin to one version
 #   ./scripts/traffic-gen.sh --url http://localhost:8080      # the local mini-alb
+#
+# The split is read two ways from the response headers:
+#   - X-Track   (stable/canary): meaningful on local/mini-alb, where the two
+#     revisions are separate services.
+#   - X-Version (APP_VERSION):   meaningful on AWS, where ECS runs one service
+#     and every task reports track=stable, so the version is what tells the
+#     revisions apart. The observed canary share falls back to the minority
+#     version when the track can't distinguish them.
 #
 # The dashboard does the same thing from the browser; this is the terminal
 # version, handy for CI or when you want a number to quote.
@@ -109,8 +116,8 @@ count_track() {
   awk -F'\t' -v want="$1" '$1 == want { n++ } END { print n + 0 }' "$RESULTS"
 }
 
-# One request: records "<track>\t<status>\t<time_total>" so the summary can be
-# built without keeping anything in memory.
+# One request: records "<track>\t<version>\t<status>\t<time_total>" so the
+# summary can be built without keeping anything in memory.
 #
 # The caller passes a unique id: bash 3.2 has no BASHPID, and $$ inside a
 # background job still resolves to the parent shell, so concurrent workers would
@@ -126,13 +133,16 @@ send_one() {
     -D "$header_file" \
     "$URL" 2>/dev/null || printf '000\t0')"
 
-  local track
+  local track version
   track="$(awk 'BEGIN{IGNORECASE=1} /^x-track:/ { gsub(/\r/, ""); print $2; exit }' \
     "$header_file" 2>/dev/null || true)"
+  version="$(awk 'BEGIN{IGNORECASE=1} /^x-version:/ { gsub(/\r/, ""); print $2; exit }' \
+    "$header_file" 2>/dev/null || true)"
   [ -n "$track" ] || track="unknown"
+  [ -n "$version" ] || version="unknown"
   rm -f "$header_file"
 
-  printf '%s\t%s\n' "$track" "$out" >>"$RESULTS"
+  printf '%s\t%s\t%s\n' "$track" "$version" "$out" >>"$RESULTS"
 }
 
 step "generating traffic"
@@ -193,46 +203,82 @@ TOTAL="$(wc -l <"$RESULTS" | tr -d ' ')"
 STABLE_COUNT="$(count_track stable)"
 CANARY_COUNT="$(count_track canary)"
 UNKNOWN_COUNT="$(count_track unknown)"
-ERRORS="$(awk -F'\t' '$2 >= 500 || $2 == "000" { n++ } END { print n+0 }' "$RESULTS")"
-AVG_MS="$(awk -F'\t' '{ sum += $3; n++ } END { if (n > 0) printf "%.0f", (sum / n) * 1000; else print 0 }' "$RESULTS")"
+ERRORS="$(awk -F'\t' '$3 >= 500 || $3 == "000" { n++ } END { print n+0 }' "$RESULTS")"
+AVG_MS="$(awk -F'\t' '{ sum += $4; n++ } END { if (n > 0) printf "%.0f", (sum / n) * 1000; else print 0 }' "$RESULTS")"
 IDENTIFIED=$((STABLE_COUNT + CANARY_COUNT))
+
+# Per-version counts (field 2). On AWS every task reports track=stable, so the
+# version is what actually separates the revisions.
+VERSIONS_SEEN="$(awk -F'\t' '$2 != "" && $2 != "unknown" { print $2 }' "$RESULTS" | sort -u | wc -l | tr -d ' ')"
+VERSIONED_TOTAL="$(awk -F'\t' '$2 != "" && $2 != "unknown" { n++ } END { print n+0 }' "$RESULTS")"
+TOP_VERSION_COUNT="$(awk -F'\t' '$2 != "" && $2 != "unknown" { c[$2]++ } END { m=0; for (v in c) if (c[v] > m) m = c[v]; print m+0 }' "$RESULTS")"
+
+# Observed canary share: prefer the track split (local), fall back to the
+# minority version (AWS, where a rollout means two versions are serving).
+if [ "$IDENTIFIED" -gt 0 ] && [ "$CANARY_COUNT" -gt 0 ]; then
+  OBSERVED_CANARY_PCT=$((CANARY_COUNT * 100 / IDENTIFIED))
+elif [ "$VERSIONS_SEEN" -ge 2 ] && [ "$VERSIONED_TOTAL" -gt 0 ]; then
+  OBSERVED_CANARY_PCT=$(((VERSIONED_TOTAL - TOP_VERSION_COUNT) * 100 / VERSIONED_TOTAL))
+else
+  OBSERVED_CANARY_PCT=0
+fi
 
 hr
 ok "sent ${TOTAL} requests"
-if [ "$IDENTIFIED" -gt 0 ]; then
+if [ "$IDENTIFIED" -gt 0 ] && [ "$CANARY_COUNT" -gt 0 ]; then
   STABLE_PCT=$((STABLE_COUNT * 100 / IDENTIFIED))
-  # Derived rather than divided again, so the two always add up to 100.
   CANARY_PCT=$((100 - STABLE_PCT))
   print_split_bar "$STABLE_COUNT" "$CANARY_COUNT"
   printf '  stable     %s requests (%s%%)\n' "$STABLE_COUNT" "$STABLE_PCT" >&2
   printf '  canary     %s requests (%s%%)\n' "$CANARY_COUNT" "$CANARY_PCT" >&2
 fi
+if [ "$VERSIONED_TOTAL" -gt 0 ]; then
+  printf '  by version (X-Version, the real split on AWS):\n' >&2
+  awk -F'\t' '
+    $2 != "" && $2 != "unknown" { c[$2]++; t++ }
+    END { for (v in c) printf "  v%-10s %s requests (%d%%)\n", v, c[v], (100 * c[v] / t) }
+  ' "$RESULTS" | sort >&2
+  printf '  observed canary share: %s%%\n' "$OBSERVED_CANARY_PCT" >&2
+fi
 printf '  errors     %s (5xx or no response)\n' "$ERRORS" >&2
 printf '  latency    %s ms average, end to end\n' "$AVG_MS" >&2
 if [ "$UNKNOWN_COUNT" -gt 0 ]; then
-  warn "${UNKNOWN_COUNT} responses had no X-Track header (usually a 503 from the load balancer itself)"
+  warn "${UNKNOWN_COUNT} responses had no X-Track/X-Version header (usually a 503 from the load balancer itself)"
 fi
 
 # Per status code breakdown, so a partial failure is visible.
 printf '  statuses   ' >&2
-awk -F'\t' '{ count[$2]++ } END { for (code in count) printf "%s=%s  ", code, count[code] }' "$RESULTS" >&2
+awk -F'\t' '{ count[$3]++ } END { for (code in count) printf "%s=%s  ", code, count[code] }' "$RESULTS" >&2
 printf '\n' >&2
 hr
 
-if [ -z "$TRACK" ] && [ "$IDENTIFIED" -gt 0 ]; then
+if [ -z "$TRACK" ] && { [ "$IDENTIFIED" -gt 0 ] || [ "$VERSIONED_TOTAL" -gt 0 ]; }; then
   info "compare with the configured weights:  ./scripts/weights.sh"
 fi
 
 # Machine readable summary, so CI can assert on the observed split.
 if [ "$AS_JSON" = true ]; then
   STATUS_JSON="$(awk -F'\t' '
-    { count[$2]++ }
+    { count[$3]++ }
     END {
       printf "{";
       first = 1;
       for (code in count) {
         if (!first) printf ",";
         printf "\"%s\":%s", code, count[code];
+        first = 0;
+      }
+      printf "}";
+    }' "$RESULTS")"
+
+  VERSIONS_JSON="$(awk -F'\t' '
+    $2 != "" && $2 != "unknown" { count[$2]++ }
+    END {
+      printf "{";
+      first = 1;
+      for (v in count) {
+        if (!first) printf ",";
+        printf "\"%s\":%s", v, count[v];
         first = 0;
       }
       printf "}";
@@ -246,6 +292,8 @@ if [ "$AS_JSON" = true ]; then
     --argjson errors "$ERRORS" \
     --argjson avgMs "$AVG_MS" \
     --argjson statuses "$STATUS_JSON" \
+    --argjson versions "$VERSIONS_JSON" \
+    --argjson observedCanaryPercent "$OBSERVED_CANARY_PCT" \
     --arg url "$URL" \
     '{
        url: $url,
@@ -256,8 +304,7 @@ if [ "$AS_JSON" = true ]; then
        errors: $errors,
        avgLatencyMs: $avgMs,
        statuses: $statuses,
-       observedCanaryPercent: (if ($stable + $canary) > 0
-                               then (100 * $canary / ($stable + $canary))
-                               else null end)
+       versions: $versions,
+       observedCanaryPercent: $observedCanaryPercent
      }'
 fi
