@@ -1,6 +1,6 @@
-# One cluster, one service. Canary behaviour comes from ECS's native
-# One service using ECS's native CANARY deployment strategy. ECS owns the green
-# revision, traffic shifting and automatic rollback. See docs/architecture.md.
+# One cluster, one service. Canary behaviour comes from ECS's native CANARY
+# deployment strategy: ECS owns the green revision, traffic shifting and
+# automatic rollback. See docs/architecture.md.
 
 resource "aws_ecs_cluster" "this" {
   name = local.name
