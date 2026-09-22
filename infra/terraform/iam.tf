@@ -73,17 +73,24 @@ data "aws_iam_policy_document" "task" {
 
   # Lets the app itself read the production listener rule's live weights
   # (app/src/alb-weights.js), so its dashboard shows the real canary split
-  # ECS is driving instead of falling back to an estimate. Read-only,
-  # scoped to this lab's own listener rule.
+  # ECS is driving instead of falling back to an estimate.
+  #
+  # elasticloadbalancing:DescribeRules is a Describe/List-style action and
+  # does not support resource-level permissions in IAM — confirmed with
+  # `aws iam simulate-principal-policy`, which returned implicitDeny with no
+  # MatchedStatements when this was scoped to a specific rule ARN. It needs
+  # Resource = "*". It's still read-only (no rule modification actions are
+  # granted), so this can only leak the shape of this account's own ALB
+  # rules, not change anything.
   statement {
-    sid    = "ReadOwnListenerRule"
+    sid    = "ReadListenerRules"
     effect = "Allow"
 
     actions = [
       "elasticloadbalancing:DescribeRules",
     ]
 
-    resources = [aws_lb_listener_rule.production.arn]
+    resources = ["*"]
   }
 }
 
