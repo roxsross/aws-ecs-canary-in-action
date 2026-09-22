@@ -139,15 +139,25 @@ resource "aws_cloudwatch_dashboard" "canary" {
 
   dashboard_body = jsonencode({
     widgets = [
-      # Canary (green, alternate target group) share of total requests,
-      # computed from raw request counts so it reflects real traffic, not
-      # just the deployment's configured canary_percent (which only names
-      # the *target* for the hold phase, not what's measured live). Per AWS's
-      # own canary deployment model, the green/new revision always runs in
-      # the alternate target group during the rollout — the "original"
-      # target group (primary here) keeps the stable revision and the
-      # majority of traffic. See:
-      # https://docs.aws.amazon.com/AmazonECS/latest/developerguide/canary-deployment.html
+      # Canary revision's share of total requests, computed from raw request
+      # counts so it reflects real traffic, not just the deployment's
+      # configured canary_percent (which only names the *target* for the
+      # hold phase, not what's measured live).
+      #
+      # Important: ECS's canary/blue-green strategy does NOT keep a fixed
+      # physical target group for "the stable revision" across deployments —
+      # confirmed live against this account by cross-checking task
+      # definitions against target group membership on two separate
+      # rollouts: the first one put the new revision in the alternate target
+      # group, the second one put it in primary. What ECS keeps constant is
+      # the *shape*: the majority of traffic (or all of it, at rest) is
+      # always on whichever target group holds the stable revision, and the
+      # minority is on whichever holds the one being tested. So this widget
+      # cannot just plot "the alternate target group's %" and call it the
+      # canary's share — half the time that would actually be the stable
+      # revision's share. MIN(a, b) / MAX(a, b) picks the canary/stable
+      # share by size instead of by which ARN it came from, same fix as
+      # app/src/alb-weights.js applies for the app's own dashboard.
       #
       # FILL(..., 0) turns "no datapoint this period" into an explicit zero —
       # without it, CloudWatch leaves a gap (null / null is null, not 0)
@@ -176,7 +186,7 @@ resource "aws_cloudwatch_dashboard" "canary" {
         width  = 24
         height = 6
         properties = {
-          title   = "Canary traffic shift: % of requests on the canary (green) revision, by APP_VERSION"
+          title   = "Canary traffic shift: % of requests on the canary revision, by APP_VERSION"
           region  = var.aws_region
           view    = "timeSeries"
           stacked = true
@@ -193,13 +203,15 @@ resource "aws_cloudwatch_dashboard" "canary" {
           }
           metrics = [
             ["AWS/ApplicationELB", "RequestCount", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix,
-              { id = "stable_requests_raw", visible = false }
+              { id = "primary_requests_raw", visible = false }
             ],
             ["AWS/ApplicationELB", "RequestCount", "TargetGroup", aws_lb_target_group.alternate.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix,
-              { id = "canary_requests_raw", visible = false }
+              { id = "alternate_requests_raw", visible = false }
             ],
-            [{ expression = "FILL(stable_requests_raw, 0)", label = "stable_requests", id = "stable_requests", visible = false }],
-            [{ expression = "FILL(canary_requests_raw, 0)", label = "canary_requests", id = "canary_requests", visible = false }],
+            [{ expression = "FILL(primary_requests_raw, 0)", label = "primary_requests", id = "primary_requests", visible = false }],
+            [{ expression = "FILL(alternate_requests_raw, 0)", label = "alternate_requests", id = "alternate_requests", visible = false }],
+            [{ expression = "MAX([primary_requests, alternate_requests])", label = "stable_requests", id = "stable_requests", visible = false }],
+            [{ expression = "MIN([primary_requests, alternate_requests])", label = "canary_requests", id = "canary_requests", visible = false }],
             [{ expression = "IF(stable_requests + canary_requests > 0, 100 * canary_requests / (stable_requests + canary_requests), 0)", label = "canary % (filled area) — rest of the axis is the stable revision", id = "canary_pct", color = "#f472b6" }],
             [{ expression = "SEARCH('{${var.metrics_namespace},Version} MetricName=\"RequestCount\"', 'Sum', 60)", label = "", id = "requestsByVersion", yAxis = "right" }],
           ]

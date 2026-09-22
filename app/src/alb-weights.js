@@ -48,23 +48,44 @@ function createWeightsReader({ config }) {
     const forward = rule?.Actions?.find((action) => action.Type === 'forward');
     const groups = forward?.ForwardConfig?.TargetGroups || [];
 
-    let stable = null;
-    let canary = null;
+    let stableTargetGroupWeight = null;
+    let canaryTargetGroupWeight = null;
     for (const group of groups) {
-      if (group.TargetGroupArn === config.stableTargetGroupArn) stable = Number(group.Weight ?? 0);
-      if (group.TargetGroupArn === config.canaryTargetGroupArn) canary = Number(group.Weight ?? 0);
+      if (group.TargetGroupArn === config.stableTargetGroupArn) {
+        stableTargetGroupWeight = Number(group.Weight ?? 0);
+      }
+      if (group.TargetGroupArn === config.canaryTargetGroupArn) {
+        canaryTargetGroupWeight = Number(group.Weight ?? 0);
+      }
     }
-    if (stable === null && canary === null) {
+    if (stableTargetGroupWeight === null && canaryTargetGroupWeight === null) {
       const ruleKind = config.productionListenerRuleArn ? 'production listener rule' : 'default listener rule';
       throw new Error(`${ruleKind} does not forward to the expected target groups`);
     }
-    const total = (stable || 0) + (canary || 0);
+
+    // ECS's canary/blue-green strategy does not keep a fixed physical
+    // target group for "the stable revision" across deployments: it puts
+    // the new revision in whichever of the two target groups isn't already
+    // running production traffic, so the "stable" and "canary" roles swap
+    // between the two ARNs from one rollout to the next (confirmed live:
+    // one rollout put the new revision in the alternate target group, the
+    // next one put it in primary). What's constant is the *shape* the
+    // weighted forward always has: the majority of traffic (or all of it,
+    // at rest) is on the revision that's actually stable, and the minority
+    // is on the one being tested. So the two raw weights are mapped to
+    // roles by size, not by which ARN they came from.
+    const weightA = stableTargetGroupWeight ?? 0;
+    const weightB = canaryTargetGroupWeight ?? 0;
+    const total = weightA + weightB;
+    const stable = Math.max(weightA, weightB);
+    const canary = Math.min(weightA, weightB);
+
     cache = {
       source: 'alb',
-      stable: stable ?? 0,
-      canary: canary ?? 0,
-      stablePercent: total ? Number((((stable ?? 0) / total) * 100).toFixed(1)) : 0,
-      canaryPercent: total ? Number((((canary ?? 0) / total) * 100).toFixed(1)) : 0,
+      stable,
+      canary,
+      stablePercent: total ? Number(((stable / total) * 100).toFixed(1)) : 0,
+      canaryPercent: total ? Number(((canary / total) * 100).toFixed(1)) : 0,
       fetchedAt: new Date().toISOString(),
       error: null,
     };
