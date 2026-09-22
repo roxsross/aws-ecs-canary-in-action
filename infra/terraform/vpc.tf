@@ -1,6 +1,5 @@
-# Network: created by default, or referenced when vpc_id is set. Either way,
-# the rest of the stack reads local.vpc_id / local.public_subnet_ids and does
-# not care which path was taken.
+# VPC created by default, or referenced when vpc_id is set. The rest of the
+# stack only reads local.vpc_id / local.public_subnet_ids.
 
 locals {
   create_vpc = var.vpc_id == ""

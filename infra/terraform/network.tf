@@ -12,8 +12,7 @@ resource "aws_security_group" "alb" {
   }
 }
 
-# Public demo page, no auth in front. Narrow allowed_ingress_cidrs to your own
-# address for anything long lived.
+# Public demo; narrow allowed_ingress_cidrs for anything long lived.
 resource "aws_vpc_security_group_ingress_rule" "alb_http" {
   for_each = toset(var.allowed_ingress_cidrs)
 
