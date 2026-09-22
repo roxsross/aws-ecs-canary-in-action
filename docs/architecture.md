@@ -6,7 +6,7 @@ Cómo está armado el laboratorio y por qué cada pieza está donde está.
 
 ## 1. El mecanismo canary
 
-**AWS real** usa la estrategia de canary nativa de ECS
+**En AWS** se usa la estrategia de canary nativa de ECS
 (`deployment_configuration` en `infra/terraform/ecs.tf`), lanzada en octubre de
 2025. Un solo servicio ECS, un ALB con dos target groups —`primary` (la
 revisión actual) y `alternate` (la revisión nueva)— y una *listener rule* de
@@ -45,9 +45,9 @@ que sondear nada. `scripts/canary-deploy.sh` y `scripts/status.sh` solo leen
 progreso al operador.
 
 **El laboratorio local** (`local/mini-alb`) sigue el diseño anterior a esta
-migración, a propósito: dos contenedores reales (`stable`/`canary`) detrás de
-un balanceador de juguete que reparte tráfico por **peso explícito**
-(`./scripts/weights.sh --target local --canary 25`), igual que un ALB real
+migración, a propósito: dos contenedores (`stable`/`canary`) detrás de un
+balanceador de juguete que reparte tráfico por **peso explícito**
+(`./scripts/weights.sh --target local --canary 25`), como se hacía con un ALB
 antes de que existiera la estrategia nativa. Es la forma más directa de
 enseñar *qué* hace un canary (pesos relativos, sorteo por petición, rollback
 como una escritura de dos números) antes de delegarlo a la orquestación de
@@ -56,7 +56,7 @@ ECS. Ver la sección 8 para el detalle del mini-ALB.
 ### Rutas forzadas (solo en el laboratorio local)
 
 En `local/mini-alb`, cuatro reglas permiten mirar una versión concreta sin
-tocar los pesos, vía `?track=` o el header `X-Canary`. En AWS real esto ya no
+tocar los pesos, vía `?track=` o el header `X-Canary`. En AWS esto ya no
 existe: no hay un track "canary" fijo al que apuntar, solo la revisión que ECS
 esté corriendo en cada target group en un momento dado.
 
@@ -80,15 +80,15 @@ navegador
 ```
 
 Las cabeceras de identidad son el truco que hace todo observable: el navegador, el
-generador de carga y CI cuentan el reparto leyendo `X-Track`, sin necesitar acceso
-a AWS.
+generador de carga y CI cuentan el reparto leyendo `X-Track` (en local) o
+`X-Version` (en AWS), sin necesitar acceso a AWS.
 
-En AWS real no hay sorteo por pesos que la app pueda observar: el ALB reenvía
-siempre al target group que la *production listener rule* apunta en ese
-momento (gestionado por ECS), y la tarea que responde no sabe si es la
-revisión `primary` o `alternate` — `TRACK` no se setea, así que toda tarea se
-identifica como `stable` por defecto. `X-Track` sigue viajando en la
-respuesta, solo que en AWS siempre vale `stable`.
+En AWS la tarea que responde no sabe si es la revisión `primary` o `alternate`:
+`TRACK` no se setea, así que toda tarea se identifica como `stable` y `X-Track`
+siempre vale `stable`. Lo que distingue a las revisiones es `X-Version`
+(`APP_VERSION`), y por eso el reparto se cuenta por versión. El porcentaje
+*configurado* lo lee la app aparte, de la *production listener rule* que ECS
+reescribe (ver `/api/weights`).
 
 ---
 
@@ -106,7 +106,7 @@ Node 22 con Express, sin build step y sin dependencias de frontend.
 | `GET /api/stats` | vista global: contadores, serie por minuto, últimas peticiones, estado de inyección de fallos, pesos |
 | `GET /api/config` | bootstrap del dashboard: paleta, identidad, capacidades |
 | `GET /api/whoami` | identidad detallada de la tarea |
-| `GET /api/weights` | pesos reales leídos del listener. En AWS real siempre cae al modo "sin `LISTENER_ARN`" (no hay pesos fijos que leer); en local sí refleja el mini-ALB |
+| `GET /api/weights` | pesos leídos del listener. En AWS lee la *production listener rule* que ECS reescribe (Terraform le pasa `LISTENER_ARN` + permiso `DescribeRules`); en local refleja el mini-ALB. Como los roles rotan, identifica la canary por el menor peso |
 | `GET/POST/DELETE /api/chaos` | inyección de fallos |
 | `POST /api/reset` | limpia los contadores |
 | `GET /metrics` | texto estilo Prometheus, por tarea |
@@ -153,7 +153,7 @@ Detalles de diseño:
 
 ### Modo degradado
 
-El store real es un **compuesto**: escribe en DynamoDB y en una copia en memoria.
+El store es un **compuesto**: escribe en DynamoDB y en una copia en memoria.
 Si DynamoDB no responde (tabla borrada, permiso faltante, throttling), las lecturas
 caen a los contadores locales y el dashboard muestra `dynamodb (degradado)` en vez
 de quedarse en blanco a mitad de una charla.
@@ -165,7 +165,7 @@ de quedarse en blanco a mitad de una charla.
 ### EMF, sin agente ni permisos extra
 
 La app escribe en stdout líneas en formato **Embedded Metric Format**. CloudWatch
-Logs las convierte en métricas reales sin agente y sin necesidad de
+Logs las convierte en métricas sin agente y sin necesidad de
 `cloudwatch:PutMetricData`:
 
 ```json

@@ -26,7 +26,7 @@ make help
 | `make smoke` | corre el smoke test contra una instancia (ver abajo) |
 | `make clean` | borra artefactos locales y `.canary.env` |
 
-Cada script en `scripts/` acepta `--help`. En AWS real ya no hay `make promote`:
+Cada script en `scripts/` acepta `--help`. En AWS ya no hay `make promote`:
 la promoción a 100% de tráfico ocurre automáticamente cuando el rollout llega a
 `COMPLETED`.
 
@@ -37,14 +37,17 @@ La app se sirve a sí misma y se mide a sí misma: manda solicitudes de prueba a
 pasando por el balanceador.
 
 En **local**, la barra "distribución configurada (ALB)" refleja los pesos que
-le pasaste al mini-ALB con `weights.sh --target local`. En **AWS real** esa
-barra cae al modo "sin `LISTENER_ARN`": no hay pesos fijos que la app pueda
-leer, porque ECS los mueve por su cuenta durante un rollout. La forma de ver el
-reparto real en AWS es el dashboard de CloudWatch (widget "Traffic
-distribution"), no el de la app.
+le pasaste al mini-ALB con `weights.sh --target local`. En **AWS**, la app lee
+los pesos de la *production listener rule* que ECS reescribe durante el rollout
+(Terraform le pasa `LISTENER_ARN` y el permiso `DescribeRules`), así que la
+barra muestra el reparto que ECS está aplicando. Como `primary`/`alternate`
+rotan de rol entre deploys, la canary se identifica por el **menor peso**, no
+por el nombre del target group. El dashboard de CloudWatch da lo mismo con
+histórico.
 
 Rutas forzadas por `?track=`/`X-Canary` solo existen en `local/mini-alb`; en
-AWS real no hay un track "canary" fijo al que apuntar.
+AWS no hay un track "canary" fijo al que apuntar (la revisión nueva se
+distingue por su `APP_VERSION`).
 
 El porcentaje de tráfico de la revisión nueva está en CloudWatch:
 `terraform output cloudwatch_dashboard_url`.
@@ -151,7 +154,7 @@ para problemas de instalación y configuración:
 | Las tareas arrancan y mueren en bucle | la imagen no existe con ese tag, o se construyó con `--platform` limitado a una arquitectura que no coincide con `var.cpu_architecture` |
 | `503` desde el ALB | no hay targets sanos. `./scripts/status.sh` y mirá el healthy de cada target group |
 | El dashboard dice "dynamodb (degradado)" | la tabla no existe o al rol de la tarea le falta permiso |
-| El peso del ALB en el dashboard de la app sale como "estimado" | esperado en AWS real: no hay `LISTENER_ARN` fijo que leer. Mirá el dashboard de CloudWatch en su lugar |
+| El peso del ALB en el dashboard de la app sale como "estimado" o "no se pudo leer el listener" | a la task le falta el permiso `elasticloadbalancing:DescribeRules` o las env vars `LISTENER_ARN`/`PRODUCTION_LISTENER_RULE_ARN`. Con el Terraform actual ya vienen; re-aplicá y redesplegá con `canary-deploy.sh` |
 | `missing environment: CANARY_...` | falta `.canary.env`. Corré `./scripts/load-env.sh` |
 | `canary-deploy.sh` dice que ya hay un rollout en curso | `rolloutState=IN_PROGRESS` en `./scripts/status.sh`. Esperalo o corré `./scripts/rollback.sh` |
 | El rollout revierte enseguida | había una alarma en `ALARM` de una demo anterior; ECS la ignora al arrancar salvo que la limpies primero (`canary-deploy.sh` ya lo hace, salvo `--no-reset-alarms`) |

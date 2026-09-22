@@ -1,13 +1,13 @@
 # Ejemplo guiado: estable → canary → latencia
 
 Un recorrido completo del flujo, primero **en local** (sin cuenta de AWS, para
-ensayar) y después **en AWS real** con Terraform. En los tres pasos hacemos lo
+ensayar) y después **en AWS** con Terraform. En los tres pasos hacemos lo
 mismo: levantar una versión estable, meter una canary, y luego inyectarle
 latencia para ver qué pasa.
 
 La diferencia de fondo entre los dos entornos:
 
-| | Local (`local/`, docker compose) | AWS real (`infra/terraform`) |
+| | Local (`local/`, docker compose) | AWS (`infra/terraform`) |
 |---|---|---|
 | Quién reparte el tráfico | vos, a mano, con `weights.sh` | ECS, solo, con su estrategia canary nativa |
 | Estable vs canary | dos servicios separados (`TRACK`) | una sola versión nueva (`APP_VERSION`) por rollout |
@@ -82,7 +82,7 @@ make local-down
 
 ---
 
-## Parte 2 — AWS real (con Terraform)
+## Parte 2 — AWS (con Terraform)
 
 Acá ECS orquesta el canary. No movés pesos a mano: disparás el rollout y ECS
 desplaza el tráfico, hace bake, vigila las alarmas y revierte solo si algo se
