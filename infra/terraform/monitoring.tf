@@ -144,8 +144,18 @@ resource "aws_cloudwatch_dashboard" "canary" {
       # canary_percent (which only names the *initial* target, not what's
       # measured live). FILL(..., 0) turns "no datapoint this period" into an
       # explicit zero — without it, CloudWatch leaves a gap (null / null is
-      # null, not 0), which is what drew the broken, disconnected line
-      # segments instead of a continuous 0-100 line across the whole range.
+      # null, not 0) instead of a continuous line across the whole range.
+      #
+      # stacked=true renders a filled area under the line instead of a bare
+      # line, which is what removes the crossing/flickering look. Only one
+      # series is plotted here (alt_pct, the new revision's share): since
+      # CloudWatch's "stacked" mode literally sums each series' value on top
+      # of the previous one, plotting both alt_pct and primary_pct together
+      # would stack 100% on top of 100% and blow past the 0-100 axis instead
+      # of reading as a clean percentage split. With a single stacked series
+      # capped at yAxis max=100, the filled area *is* "new revision %" and
+      # the empty space above it *is* "current revision %" — one glance
+      # tells you the split without two lines crossing each other.
       {
         type   = "metric"
         x      = 0
@@ -153,11 +163,12 @@ resource "aws_cloudwatch_dashboard" "canary" {
         width  = 24
         height = 6
         properties = {
-          title  = "Traffic distribution: new revision's share of total requests (%)"
-          region = var.aws_region
-          view   = "timeSeries"
-          period = 60
-          stat   = "Sum"
+          title   = "Traffic distribution: % of requests on the new revision"
+          region  = var.aws_region
+          view    = "timeSeries"
+          stacked = true
+          period  = 60
+          stat    = "Sum"
           yAxis = {
             left = { min = 0, max = 100, label = "% of total requests" }
           }
@@ -170,8 +181,7 @@ resource "aws_cloudwatch_dashboard" "canary" {
             ],
             [{ expression = "FILL(primary_requests_raw, 0)", label = "primary_requests", id = "primary_requests", visible = false }],
             [{ expression = "FILL(alternate_requests_raw, 0)", label = "alternate_requests", id = "alternate_requests", visible = false }],
-            [{ expression = "IF(primary_requests + alternate_requests > 0, 100 * alternate_requests / (primary_requests + alternate_requests), 0)", label = "new revision %", id = "alt_pct", color = "#f472b6" }],
-            [{ expression = "IF(primary_requests + alternate_requests > 0, 100 * primary_requests / (primary_requests + alternate_requests), 100)", label = "current revision %", id = "primary_pct", color = "#22d3ee" }],
+            [{ expression = "IF(primary_requests + alternate_requests > 0, 100 * alternate_requests / (primary_requests + alternate_requests), 0)", label = "new revision % (filled area) — rest of the axis is the current revision", id = "alt_pct", color = "#f472b6" }],
           ]
         }
       },
