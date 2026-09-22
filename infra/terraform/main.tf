@@ -11,8 +11,7 @@ locals {
 
   ecr_repository_url = "${local.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/${local.ecr_repository_name}"
 
-  # Composed rather than looked up, so `terraform plan` works even before the
-  # image exists in the registry.
+  # Composed, not looked up, so plan works before the image exists.
   container_image = var.container_image != "" ? var.container_image : "${local.ecr_repository_url}:${var.image_tag}"
 
   table_name     = "${var.project_name}-traffic"
@@ -20,9 +19,7 @@ locals {
   service_name   = "${var.project_name}-app"
   task_family    = "${var.project_name}-app"
 
-  # Iterated in monitoring.tf to create one metric alarm per target group per
-  # signal (5xx, latency, unhealthy), since neither target group can be
-  # trusted to always be "the canary" — see the comment above tg_5xx there.
+  # Both target groups get their own alarms; the canary role swaps between them.
   target_groups = {
     primary   = aws_lb_target_group.primary
     alternate = aws_lb_target_group.alternate
@@ -35,12 +32,7 @@ locals {
     canary_error_rate = "${var.project_name}-canary-error-rate"
   }
 
-  # The alarm names deployment_configuration.alarms watches for automatic
-  # rollback. canary_5xx/latency/unhealthy are composite alarms (OR of the
-  # same signal on both target groups, see monitoring.tf) so a problem on
-  # whichever target group is actually running the canary this deployment
-  # gets caught regardless of which physical target group that turns out to
-  # be. Filters out the EMF-based one when it's disabled.
+  # Alarm names ECS watches for automatic rollback (EMF one dropped when disabled).
   rollback_alarm_names = concat(
     [
       aws_cloudwatch_composite_alarm.canary_5xx.alarm_name,
@@ -50,7 +42,7 @@ locals {
     var.enable_emf_alarm ? [aws_cloudwatch_metric_alarm.canary_error_rate[0].alarm_name] : [],
   )
 
-  # Same alarms, as ARNs, for the CloudWatch dashboard's "alarm" widget.
+  # Same alarms as ARNs, for the dashboard's alarm widget.
   rollback_alarm_arns = concat(
     [
       aws_cloudwatch_composite_alarm.canary_5xx.arn,
@@ -70,21 +62,8 @@ locals {
     var.tags,
   )
 
-  # ADMIN_TOKEN travels as a plain env var (visible via ecs:DescribeTaskDefinition).
-  # Accepted lab tradeoff — see "Seguridad" in the README before using this for real.
-  #
-  # LISTENER_ARN / *_TARGET_GROUP_ARN / PRODUCTION_LISTENER_RULE_ARN let the
-  # app's live-weights reader (app/src/alb-weights.js) read the real traffic
-  # split. Important: primary and alternate do NOT keep a fixed stable/canary
-  # role across deployments — confirmed live against this account by cross-
-  # checking running task definitions against target group membership on two
-  # separate rollouts: the first one put the new revision in the alternate
-  # target group, the second one put it in primary. So the app doesn't trust
-  # "primary = stable" as a label; it reads both weights and picks the larger
-  # one as stable, the smaller as canary (same fix applied to the dashboard's
-  # traffic widget and to the mirrored per-target-group alarms below).
-  # PRODUCTION_LISTENER_RULE_ARN matters because that's the rule ECS actually
-  # rewrites during a rollout, not the listener's default action.
+  # ADMIN_TOKEN is a plain env var (lab tradeoff). The LISTENER/TARGET_GROUP/RULE
+  # ARNs let the app read the live traffic split from the production rule.
   base_environment = [
     { name = "PROJECT_NAME", value = var.project_name },
     { name = "PORT", value = tostring(var.container_port) },
