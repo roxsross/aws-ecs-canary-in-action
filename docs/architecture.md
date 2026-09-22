@@ -194,21 +194,26 @@ Se emite cada 10 segundos con los valores agregados, no una línea por petición
 
 ### Las cuatro alarmas que deciden el rollback
 
-En AWS real apuntan **al target group `alternate`** — ahí es donde corre la
-revisión nueva mientras ECS la está probando. Sus nombres están listados en
-`aws_ecs_service.app.alarms.alarm_names`, así que **ECS mismo las vigila**
-durante el rollout (`DescribeAlarms` interno) y revierte el tráfico si alguna
-pasa a `ALARM`; no hay ningún script haciendo polling.
+Como ECS alterna en cada deploy cuál target group (`primary`/`alternate`) corre
+la revisión nueva, no alcanza con vigilar uno solo. Cada señal se mide en
+**ambos** target groups y se combina en una **alarma compuesta**
+(`ALARM(primary) OR ALARM(alternate)`). Esas compuestas —más la de tasa de error
+sobre EMF— son las que `aws_ecs_service.app.alarms.alarm_names` lista, así que
+**ECS mismo las vigila** durante el rollout (`DescribeAlarms` interno) y revierte
+el tráfico si alguna pasa a `ALARM`; no hay ningún script haciendo polling.
 
-| Alarma | Métrica | Dispara con |
+| Alarma (compuesta salvo la de EMF) | Métrica por target group | Dispara con |
 |---|---|---|
 | `<proyecto>-canary-5xx` | `HTTPCode_Target_5XX_Count` (Sum) | ≥ 3 en un periodo |
 | `<proyecto>-canary-latency` | `TargetResponseTime` (p95) | > 1 s |
 | `<proyecto>-canary-unhealthy` | `UnHealthyHostCount` (Max) | ≥ 1 |
 | `<proyecto>-canary-error-rate` | math sobre EMF: `100 * errors / requests` | > 5% |
 
-- `treatMissingData: notBreaching` en las cuatro: **sin tráfico en la nueva
-  revisión no hay fallo**, y al principio del rollout no hay datos.
+- Vigilar ambos target groups implica que una regresión en la revisión estable
+  —no solo en la canary— también dispara el rollback, que de todos modos es
+  deseable.
+- `treatMissingData: notBreaching` en todas: **sin tráfico en un target group no
+  hay fallo**, y al principio del rollout no hay datos.
 - `evaluation_periods = 1` y `period = 60` para que una demo en vivo reaccione
   rápido. En producción querrás 2 o 3 periodos para no reaccionar al ruido.
 - La de error rate viene de las métricas de la app, así que atrapa fallos que nunca
@@ -226,36 +231,43 @@ juzga **el target group**, que es también quien alimenta las alarmas.
 
 ### El dashboard de CloudWatch
 
-`infra/terraform/monitoring.tf` crea `<proyecto>-canary`, con siete widgets,
-comparando el target group `primary` (revisión actual) contra `alternate` (la
-revisión que ECS esté probando, si hay un rollout en curso):
+`infra/terraform/monitoring.tf` crea `<proyecto>-canary`. Un encabezado de texto
+explica cómo leerlo, y arriba van las vistas *lógicas* (por versión), abajo las
+*físicas* (por target group, cuyo rol de estable/canary rota entre deploys):
 
 | Widget | Qué muestra |
 |---|---|
-| Traffic distribution | el porcentaje de tráfico de la revisión nueva, en vivo |
-| Requests per target group | volumen absoluto (`RequestCount`) por target group |
-| 5xx per target group | errores del servidor por target group, con la línea de la alarma |
-| p95 latency per target group | latencia por target group, con la línea del presupuesto |
-| Healthy targets | targets sanos/enfermos por target group |
-| Application metrics (EMF) | `RequestCount`/`ErrorCount` agregados de toda la app |
-| Canary rollback triggers | estado de las cuatro alarmas, de un vistazo |
+| Canary traffic shift | el porcentaje de tráfico de la revisión canary, en vivo |
+| Requests by APP_VERSION (EMF) | solicitudes por `APP_VERSION` — quién es cada revisión |
+| Errors by APP_VERSION (EMF) | errores por `APP_VERSION` |
+| 5xx rate per target group (%) | tasa de 5xx por target group, comparable con split desigual |
+| 5xx counts: target + ALB-level | 5xx de target + `HTTPCode_ELB_5XX` + errores de conexión |
+| Latency p50/p95/p99 | latencia por target group, con la línea del presupuesto |
+| Healthy / unhealthy targets | targets sanos/enfermos (min/max por minuto) |
+| Canary rollback triggers | estado de las alarmas, de un vistazo |
+
+Los dos widgets por `APP_VERSION` usan `SEARCH` acotado con `SORT(..., MAX, DESC,
+4)` para mostrar solo las versiones más activas, no todas las que alguna vez se
+desplegaron.
 
 El primero responde la pregunta que más se hace en una demo: *¿cuánto tráfico
-está recibiendo la revisión nueva ahora mismo?* Se calcula con **metric math**,
-a partir del `RequestCount` real de cada target group (no hay un weight fijo
-que leer: ECS lo cambia por su cuenta durante el rollout):
+está recibiendo la revisión canary ahora mismo?* Como `primary`/`alternate`
+rotan de rol, no se puede asumir que la canary es siempre `alternate`; se la
+identifica por el **menor tráfico** con **metric math** sobre el `RequestCount`
+de cada target group:
 
 ```
-primary_requests   = RequestCount(TargetGroup=primary)    ; visible=false, es la métrica base
-alternate_requests = RequestCount(TargetGroup=alternate)  ; visible=false, es la métrica base
-alt_pct     = 100 * alternate_requests / (primary_requests + alternate_requests)
-primary_pct = 100 * primary_requests / (primary_requests + alternate_requests)
+primary_requests   = FILL(RequestCount(TargetGroup=primary), 0)     ; visible=false
+alternate_requests = FILL(RequestCount(TargetGroup=alternate), 0)   ; visible=false
+canary_requests    = MIN(primary_requests, alternate_requests)      ; el de menor tráfico
+stable_requests    = MAX(primary_requests, alternate_requests)
+canary_pct         = 100 * canary_requests / (stable_requests + canary_requests)
 ```
 
-Las métricas base van con `visible: false` porque solo existen para alimentar la
-expresión; lo único que se dibuja son las dos líneas de porcentaje. Mismo patrón
-que ya usa la alarma `canary-error-rate`, solo que aquí el resultado es para
-mirar, no para disparar un rollback.
+`FILL(..., 0)` evita huecos cuando un periodo no tiene datos, y el área apilada
+capada a 0-100 hace que el relleno sea el % de la canary y el espacio de arriba,
+el de la estable. Es el mismo criterio (por magnitud, no por ARN) que aplica
+`app/src/alb-weights.js` para el dashboard de la app.
 
 ---
 
@@ -347,7 +359,7 @@ coinciden, la tarea muere con un error de formato de ejecutable.
 
 `local/mini-alb/server.js` son unas 250 líneas de Node sin dependencias que
 imitan las partes de un ALB con pesos manuales. Es intencionalmente el modelo
-*anterior* a la migración de AWS real a la estrategia canary nativa de ECS
+*anterior* a la migración a la estrategia canary nativa de ECS
 (sección 1): sigue siendo la forma más directa de enseñar el mecanismo de
 pesos en sí, sin la orquestación de ECS por delante.
 
