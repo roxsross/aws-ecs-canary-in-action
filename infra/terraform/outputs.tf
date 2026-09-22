@@ -48,9 +48,9 @@ output "canary_env" {
     CANARY_ECR_URI             = local.ecr_repository_url
     CANARY_TABLE               = aws_dynamodb_table.traffic.name
     CANARY_LOG_GROUP           = aws_cloudwatch_log_group.app.name
-    CANARY_ALARM_5XX           = aws_cloudwatch_metric_alarm.canary_5xx.alarm_name
-    CANARY_ALARM_LATENCY       = aws_cloudwatch_metric_alarm.canary_latency.alarm_name
-    CANARY_ALARM_UNHEALTHY     = aws_cloudwatch_metric_alarm.canary_unhealthy.alarm_name
+    CANARY_ALARM_5XX           = aws_cloudwatch_composite_alarm.canary_5xx.alarm_name
+    CANARY_ALARM_LATENCY       = aws_cloudwatch_composite_alarm.canary_latency.alarm_name
+    CANARY_ALARM_UNHEALTHY     = aws_cloudwatch_composite_alarm.canary_unhealthy.alarm_name
     CANARY_ALARM_ERRORRATE     = var.enable_emf_alarm ? aws_cloudwatch_metric_alarm.canary_error_rate[0].alarm_name : ""
     CANARY_CONTAINER_NAME      = "app"
     CANARY_CONTAINER_PORT      = tostring(var.container_port)

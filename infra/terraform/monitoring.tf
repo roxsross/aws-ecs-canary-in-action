@@ -184,8 +184,12 @@ resource "aws_cloudwatch_metric_alarm" "canary_error_rate" {
   tags = { Name = local.alarm_names.canary_error_rate }
 }
 
-# Dashboard comparing the primary (current production) and alternate (the
-# revision ECS is rolling out) target groups side by side.
+# Dashboard comparing the primary and alternate target groups side by side.
+# Which one is "stable" and which is "canary" swaps between deployments (see
+# tg_5xx above), so most widgets here plot both raw target groups without
+# claiming either one is the canary — only the top widget and the two
+# per-APP_VERSION EMF widgets make that call, and they do it by request
+# volume / real version string, not by ARN.
 
 resource "aws_cloudwatch_dashboard" "canary" {
   count = var.enable_dashboard ? 1 : 0
@@ -351,7 +355,8 @@ resource "aws_cloudwatch_dashboard" "canary" {
           metrics = [
             ["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { label = "primary healthy" }],
             ["...", aws_lb_target_group.alternate.arn_suffix, ".", aws_lb.this.arn_suffix, { label = "alternate healthy" }],
-            ["AWS/ApplicationELB", "UnHealthyHostCount", "TargetGroup", aws_lb_target_group.alternate.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { label = "alternate unhealthy", color = "#d62728" }],
+            ["AWS/ApplicationELB", "UnHealthyHostCount", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix, { label = "primary unhealthy", color = "#d62728" }],
+            ["...", aws_lb_target_group.alternate.arn_suffix, ".", aws_lb.this.arn_suffix, { label = "alternate unhealthy", color = "#f472b6" }],
           ]
         }
       },
