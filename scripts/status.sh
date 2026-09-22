@@ -49,18 +49,18 @@ require_canary_env \
   CANARY_CLUSTER CANARY_SERVICE CANARY_TG_PRIMARY CANARY_TG_ALTERNATE
 
 collect_json() {
-  local service_json production_tg
+  local service_json weights_pair
+
   service_json="$(ecs_service_json)"
-  production_tg="$(alb_production_target_group 2>/dev/null || printf '')"
+  weights_pair="$(alb_production_weights 2>/dev/null || printf '0 0')"
 
   jq -n \
     --argjson service "$service_json" \
     --argjson primaryHealth "$(tg_health_states "$CANARY_TG_PRIMARY")" \
     --argjson alternateHealth "$(tg_health_states "$CANARY_TG_ALTERNATE")" \
     --argjson alarms "$(alarms_json)" \
-    --arg productionTg "$production_tg" \
-    --arg primaryTg "$CANARY_TG_PRIMARY" \
-    --arg alternateTg "$CANARY_TG_ALTERNATE" \
+    --argjson primaryWeight "${weights_pair%% *}" \
+    --argjson alternateWeight "${weights_pair##* }" \
     --arg albDns "${CANARY_ALB_DNS:-}" \
     --arg cluster "$CANARY_CLUSTER" \
     --arg region "$(canary_region)" \
@@ -68,6 +68,7 @@ collect_json() {
     def health_summary:
       { total: length, healthy: ([.[] | select(. == "healthy")] | length), states: . };
     ($service.deployments // [] | map(select(.status == "PRIMARY")) | first) as $primaryDeployment
+    | ($primaryWeight + $alternateWeight) as $total
     | {
         region: $region,
         cluster: $cluster,
@@ -83,7 +84,12 @@ collect_json() {
           strategy: ($service.deploymentConfiguration.strategy // "ROLLING"),
           canaryPercent: ($service.deploymentConfiguration.canaryConfiguration.canaryPercent // null)
         },
-        productionTargetGroup: (if $productionTg == $primaryTg then "primary" elif $productionTg == $alternateTg then "alternate" else "unknown" end),
+        split: {
+          primaryWeight: $primaryWeight,
+          alternateWeight: $alternateWeight,
+          primaryPercent: (if $total > 0 then (100 * $primaryWeight / $total) else 100 end),
+          alternatePercent: (if $total > 0 then (100 * $alternateWeight / $total) else 0 end)
+        },
         targets: {
           primary: ($primaryHealth | health_summary),
           alternate: ($alternateHealth | health_summary)
@@ -110,9 +116,14 @@ print_report() {
   printf '%s' "$snapshot" | jq -r '
     "  \(.service.name)\tdesired=\(.service.desired) running=\(.service.running) pending=\(.service.pending)\t\(.service.taskDefinition)",
     "  strategy=\(.service.strategy)\(if .service.canaryPercent then " canary_percent=\(.service.canaryPercent)%" else "" end)  rollout=\(.service.rolloutState)",
-    "  production traffic -> \(.productionTargetGroup) target group",
     "  healthy   primary=\(.targets.primary.healthy)/\(.targets.primary.total)  alternate=\(.targets.alternate.healthy)/\(.targets.alternate.total)"
   ' >&2
+
+  local primary_weight alternate_weight
+  primary_weight="$(printf '%s' "$snapshot" | jq -r '.split.primaryWeight')"
+  alternate_weight="$(printf '%s' "$snapshot" | jq -r '.split.alternateWeight')"
+  printf '\n  %sTRAFFIC SPLIT%s\n' "$C_BOLD" "$C_RESET" >&2
+  print_split_bar "$primary_weight" "$alternate_weight" 40 primary alternate
 
   local reason
   reason="$(printf '%s' "$snapshot" | jq -r '.service.rolloutStateReason // ""')"

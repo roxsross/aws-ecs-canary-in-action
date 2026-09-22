@@ -148,7 +148,7 @@ info "watch it live: ./scripts/status.sh --watch"
 info "dashboard:     $(app_url)"
 hr
 
-if ! ecs_wait_rollout "$TIMEOUT" "$POLL"; then
+if ! ecs_wait_rollout "$NEW_TASKDEF" "$TIMEOUT" "$POLL"; then
   hr
   err "the rollout did not complete successfully"
   print_alarm_states

@@ -100,7 +100,7 @@ awsx ecs update-service \
 ok "update-service called; ECS is rolling it out through the same canary strategy"
 
 hr
-if ! ecs_wait_rollout "$TIMEOUT" "$POLL"; then
+if ! ecs_wait_rollout "$REVERT_TASKDEF" "$TIMEOUT" "$POLL"; then
   err "the rollback rollout did not complete; check ./scripts/status.sh"
   exit 1
 fi

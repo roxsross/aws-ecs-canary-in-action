@@ -142,7 +142,10 @@ resource "aws_cloudwatch_dashboard" "canary" {
       # New revision's share of total requests, computed from raw request
       # counts so it reflects real traffic, not the deployment's configured
       # canary_percent (which only names the *initial* target, not what's
-      # measured live).
+      # measured live). FILL(..., 0) turns "no datapoint this period" into an
+      # explicit zero — without it, CloudWatch leaves a gap (null / null is
+      # null, not 0), which is what drew the broken, disconnected line
+      # segments instead of a continuous 0-100 line across the whole range.
       {
         type   = "metric"
         x      = 0
@@ -160,13 +163,15 @@ resource "aws_cloudwatch_dashboard" "canary" {
           }
           metrics = [
             ["AWS/ApplicationELB", "RequestCount", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix,
-              { id = "primary_requests", visible = false }
+              { id = "primary_requests_raw", visible = false }
             ],
             ["AWS/ApplicationELB", "RequestCount", "TargetGroup", aws_lb_target_group.alternate.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix,
-              { id = "alternate_requests", visible = false }
+              { id = "alternate_requests_raw", visible = false }
             ],
-            [{ expression = "100 * alternate_requests / (primary_requests + alternate_requests)", label = "new revision %", id = "alt_pct", color = "#f472b6" }],
-            [{ expression = "100 * primary_requests / (primary_requests + alternate_requests)", label = "current revision %", id = "primary_pct", color = "#22d3ee" }],
+            [{ expression = "FILL(primary_requests_raw, 0)", label = "primary_requests", id = "primary_requests", visible = false }],
+            [{ expression = "FILL(alternate_requests_raw, 0)", label = "alternate_requests", id = "alternate_requests", visible = false }],
+            [{ expression = "IF(primary_requests + alternate_requests > 0, 100 * alternate_requests / (primary_requests + alternate_requests), 0)", label = "new revision %", id = "alt_pct", color = "#f472b6" }],
+            [{ expression = "IF(primary_requests + alternate_requests > 0, 100 * primary_requests / (primary_requests + alternate_requests), 100)", label = "current revision %", id = "primary_pct", color = "#22d3ee" }],
           ]
         }
       },
@@ -260,23 +265,43 @@ resource "aws_cloudwatch_dashboard" "canary" {
         width  = 12
         height = 6
         properties = {
-          title  = "Application metrics (EMF)"
+          title  = "Requests by APP_VERSION (EMF)"
+          region = var.aws_region
+          view   = "timeSeries"
+          period = 60
+          stat   = "Sum"
+          # SEARCH discovers one series per distinct Version dimension value
+          # the app has actually emitted, so the legend shows the real
+          # APP_VERSION strings running right now, not a static "primary" /
+          # "alternate" label that doesn't say which version that is.
+          metrics = [
+            [{ expression = "SEARCH('{${var.metrics_namespace},Version} MetricName=\"RequestCount\"', 'Sum', 60)", id = "requestsByVersion" }],
+          ]
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 18
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Errors by APP_VERSION (EMF)"
           region = var.aws_region
           view   = "timeSeries"
           period = 60
           stat   = "Sum"
           metrics = [
-            [var.metrics_namespace, "RequestCount", { label = "requests" }],
-            [var.metrics_namespace, "ErrorCount", { label = "errors", color = "#d62728" }],
+            [{ expression = "SEARCH('{${var.metrics_namespace},Version} MetricName=\"ErrorCount\"', 'Sum', 60)", id = "errorsByVersion", color = "#d62728" }],
           ]
         }
       },
       {
         type   = "alarm"
-        x      = 12
-        y      = 18
-        width  = 12
-        height = 6
+        x      = 0
+        y      = 24
+        width  = 24
+        height = 4
         properties = {
           title  = "Canary rollback triggers"
           alarms = local.rollback_alarm_arns

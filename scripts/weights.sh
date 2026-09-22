@@ -110,11 +110,11 @@ require_canary_env CANARY_CLUSTER CANARY_SERVICE CANARY_TG_PRIMARY CANARY_TG_ALT
 
 step "current rollout state"
 STATE="$(ecs_rollout_state)"
-PRODUCTION_TG="$(alb_production_target_group 2>/dev/null || printf 'unknown')"
+WEIGHTS="$(alb_production_weights 2>/dev/null || printf '0 0')"
 info "rollout state    ${STATE}"
-info "production ->    $([ "$PRODUCTION_TG" = "$CANARY_TG_PRIMARY" ] && printf 'primary' || printf 'alternate') target group"
 info "canary strategy  $(canary_deployment_summary)"
 info "healthy          primary=$(tg_healthy_count "$CANARY_TG_PRIMARY") alternate=$(tg_healthy_count "$CANARY_TG_ALTERNATE")"
+print_split_bar "${WEIGHTS%% *}" "${WEIGHTS##* }" 40 primary alternate
 
 if [ "$STATE" = "IN_PROGRESS" ]; then
   info ""

@@ -118,14 +118,29 @@ confirm() {
 
 # --------------------------------------------------------- load balancer ----
 
-# Reads whichever target group the production listener rule currently forwards
-# to (100% of it: ECS's native canary strategy uses a single forward action
-# with no per-target-group weight, unlike the old hand-rolled listener).
+# Reads whichever target group the production listener rule is sending most of
+# the traffic to right now. ECS's native canary strategy still uses a weighted
+# ForwardConfig under the hood (like the old hand-rolled listener did), it just
+# owns the weights itself: 100/0 at rest, temporarily split during a rollout.
 alb_production_target_group() {
   awsx elbv2 describe-rules \
     --rule-arns "$CANARY_PRODUCTION_RULE_ARN" \
-    --query 'Rules[0].Actions[0].TargetGroupArn' \
+    --query 'Rules[0].Actions[0].ForwardConfig.TargetGroups | sort_by(@, &Weight) | [-1].TargetGroupArn' \
     --output text
+}
+
+# Both weights of the production rule, as "primary alternate", for status.sh.
+alb_production_weights() {
+  local json primary alternate
+  json="$(awsx elbv2 describe-rules \
+    --rule-arns "$CANARY_PRODUCTION_RULE_ARN" \
+    --query 'Rules[0].Actions[0].ForwardConfig.TargetGroups' \
+    --output json)"
+  primary="$(printf '%s' "$json" | jq -r --arg tg "$CANARY_TG_PRIMARY" \
+    '[.[] | select(.TargetGroupArn == $tg) | .Weight] | first // 0')"
+  alternate="$(printf '%s' "$json" | jq -r --arg tg "$CANARY_TG_ALTERNATE" \
+    '[.[] | select(.TargetGroupArn == $tg) | .Weight] | first // 0')"
+  printf '%s %s\n' "$primary" "$alternate"
 }
 
 # ----------------------------------------------------------- target health --
@@ -268,15 +283,23 @@ canary_deployment_summary() {
 }
 
 # Polls rolloutState until it leaves IN_PROGRESS, printing progress. Returns 0
-# for COMPLETED, 1 for anything else (FAILED, or timeout).
+# only if it completes AND the running task definition matches what we asked
+# for — rolloutState alone is ambiguous: ECS reports COMPLETED both when a
+# rollout finishes *and* when a rollback it triggered finishes. 1 covers both
+# FAILED and "completed, but rolled back to the old task definition".
 ecs_wait_rollout() {
-  local timeout="${1:-1800}" poll="${2:-15}" waited=0 state
+  local expected_taskdef="${1:-}" timeout="${2:-1800}" poll="${3:-15}" waited=0 state current_taskdef
   while [ "$waited" -lt "$timeout" ]; do
     state="$(ecs_rollout_state)"
     case "$state" in
       COMPLETED)
-        ok "rollout completed"
-        return 0
+        current_taskdef="$(ecs_task_definition)"
+        if [ -z "$expected_taskdef" ] || [ "$current_taskdef" = "$expected_taskdef" ]; then
+          ok "rollout completed"
+          return 0
+        fi
+        err "ECS rolled back: the service is back on ${current_taskdef##*/}, not ${expected_taskdef##*/}"
+        return 1
         ;;
       FAILED)
         err "rollout failed (ECS rolled back automatically if alarms/rollback were enabled)"
@@ -386,9 +409,10 @@ app_url() {
 }
 
 # Draws a small ASCII bar for the traffic split, so terminal output shows the
-# same picture as the dashboard.
+# same picture as the dashboard. Labels default to stable/canary (local mini-alb);
+# pass a 4th/5th arg to relabel for AWS's primary/alternate.
 print_split_bar() {
-  local stable="$1" canary="$2" width="${3:-40}"
+  local stable="$1" canary="$2" width="${3:-40}" left_label="${4:-stable}" right_label="${5:-canary}"
   local total=$((stable + canary))
   [ "$total" -gt 0 ] || total=1
   local canary_cells=$((canary * width / total))
@@ -405,8 +429,8 @@ print_split_bar() {
     canary_bar="${canary_bar}█"
     j=$((j + 1))
   done
-  printf '  %s%s%s%s%s%s  stable %s%% / canary %s%%\n' \
+  printf '  %s%s%s%s%s%s  %s %s%% / %s %s%%\n' \
     "$C_CYAN" "$bar" "$C_RESET" \
     "$C_MAGENTA" "$canary_bar" "$C_RESET" \
-    $((stable * 100 / total)) $((canary * 100 / total)) >&2
+    "$left_label" $((stable * 100 / total)) "$right_label" $((canary * 100 / total)) >&2
 }
