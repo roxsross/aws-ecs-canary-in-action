@@ -33,9 +33,19 @@ function createWeightsReader({ config }) {
 
   async function refresh() {
     const elb = lazyClient();
-    const res = await elb.send(new DescribeRulesCommand({ ListenerArn: config.listenerArn }));
-    const defaultRule = (res.Rules || []).find((rule) => rule.IsDefault);
-    const forward = defaultRule?.Actions?.find((action) => action.Type === 'forward');
+    // ECS's native canary/blue-green strategy rewrites the weighted
+    // ForwardConfig on the production listener *rule* (a non-default rule
+    // with its own priority), not on the listener's default action — the
+    // default action stays a plain 100%-to-one-target-group forward the
+    // whole time. When productionListenerRuleArn is set, look that rule up
+    // directly instead of scanning for IsDefault.
+    const res = config.productionListenerRuleArn
+      ? await elb.send(new DescribeRulesCommand({ RuleArns: [config.productionListenerRuleArn] }))
+      : await elb.send(new DescribeRulesCommand({ ListenerArn: config.listenerArn }));
+    const rule = config.productionListenerRuleArn
+      ? (res.Rules || [])[0]
+      : (res.Rules || []).find((r) => r.IsDefault);
+    const forward = rule?.Actions?.find((action) => action.Type === 'forward');
     const groups = forward?.ForwardConfig?.TargetGroups || [];
 
     let stable = null;
@@ -45,7 +55,8 @@ function createWeightsReader({ config }) {
       if (group.TargetGroupArn === config.canaryTargetGroupArn) canary = Number(group.Weight ?? 0);
     }
     if (stable === null && canary === null) {
-      throw new Error('default listener rule does not forward to the expected target groups');
+      const ruleKind = config.productionListenerRuleArn ? 'production listener rule' : 'default listener rule';
+      throw new Error(`${ruleKind} does not forward to the expected target groups`);
     }
     const total = (stable || 0) + (canary || 0);
     cache = {

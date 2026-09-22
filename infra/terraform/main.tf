@@ -61,12 +61,16 @@ locals {
   # ADMIN_TOKEN travels as a plain env var (visible via ecs:DescribeTaskDefinition).
   # Accepted lab tradeoff — see "Seguridad" in the README before using this for real.
   #
-  # Deliberately no LISTENER_ARN / *_TARGET_GROUP_ARN here: with ECS's native
-  # canary strategy, ECS itself rewrites the production listener rule (not the
-  # listener's default action) during a deployment, and there is no fixed
-  # "stable"/"canary" target group pair to point the app's live-weights reader
-  # at. The dashboard falls back to its already-supported "no LISTENER_ARN"
-  # mode and shows the observed split instead of the configured one.
+  # LISTENER_ARN / *_TARGET_GROUP_ARN / PRODUCTION_LISTENER_RULE_ARN: primary
+  # and alternate are not an arbitrary pair here. Per AWS's own canary/blue-
+  # green deployment model, the "original" target group (primary) always
+  # keeps the current stable revision and the majority of traffic, and the
+  # "alternate" target group always receives the new/canary revision during
+  # a rollout - confirmed live against this account's ALB while a rollout was
+  # in progress. That pairing is fixed across every deployment, so the app's
+  # live-weights reader (app/src/alb-weights.js) can point at it directly.
+  # It reads PRODUCTION_LISTENER_RULE_ARN (not the listener's default action)
+  # because that's the rule ECS actually rewrites during a rollout.
   base_environment = [
     { name = "PROJECT_NAME", value = var.project_name },
     { name = "PORT", value = tostring(var.container_port) },
@@ -75,5 +79,9 @@ locals {
     { name = "RECORD_MODE", value = var.record_mode },
     { name = "METRICS_NAMESPACE", value = var.metrics_namespace },
     { name = "ADMIN_TOKEN", value = var.admin_token },
+    { name = "LISTENER_ARN", value = aws_lb_listener.http.arn },
+    { name = "STABLE_TARGET_GROUP_ARN", value = aws_lb_target_group.primary.arn },
+    { name = "CANARY_TARGET_GROUP_ARN", value = aws_lb_target_group.alternate.arn },
+    { name = "PRODUCTION_LISTENER_RULE_ARN", value = aws_lb_listener_rule.production.arn },
   ]
 }

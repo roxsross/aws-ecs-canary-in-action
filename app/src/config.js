@@ -54,6 +54,12 @@ const config = {
   listenerArn: process.env.LISTENER_ARN || '',
   stableTargetGroupArn: process.env.STABLE_TARGET_GROUP_ARN || '',
   canaryTargetGroupArn: process.env.CANARY_TARGET_GROUP_ARN || '',
+  // Optional: ECS's native canary/blue-green strategy puts the weighted
+  // ForwardConfig on the production listener *rule* it rewrites during a
+  // rollout, not on the listener's default action. When set, alb-weights.js
+  // reads this rule instead of the default one. Unset (e.g. local/mini-alb,
+  // which has no such rule) falls back to the default action, unchanged.
+  productionListenerRuleArn: process.env.PRODUCTION_LISTENER_RULE_ARN || '',
   weightsCacheMs: num(process.env.WEIGHTS_CACHE_MS, 8000),
 
   metricsNamespace: process.env.METRICS_NAMESPACE || 'CanaryLab',

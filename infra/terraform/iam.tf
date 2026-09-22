@@ -70,6 +70,21 @@ data "aws_iam_policy_document" "task" {
       resources = ["*"]
     }
   }
+
+  # Lets the app itself read the production listener rule's live weights
+  # (app/src/alb-weights.js), so its dashboard shows the real canary split
+  # ECS is driving instead of falling back to an estimate. Read-only,
+  # scoped to this lab's own listener rule.
+  statement {
+    sid    = "ReadOwnListenerRule"
+    effect = "Allow"
+
+    actions = [
+      "elasticloadbalancing:DescribeRules",
+    ]
+
+    resources = [aws_lb_listener_rule.production.arn]
+  }
 }
 
 resource "aws_iam_role_policy" "task" {

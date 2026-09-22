@@ -139,23 +139,36 @@ resource "aws_cloudwatch_dashboard" "canary" {
 
   dashboard_body = jsonencode({
     widgets = [
-      # New revision's share of total requests, computed from raw request
-      # counts so it reflects real traffic, not the deployment's configured
-      # canary_percent (which only names the *initial* target, not what's
-      # measured live). FILL(..., 0) turns "no datapoint this period" into an
-      # explicit zero — without it, CloudWatch leaves a gap (null / null is
-      # null, not 0) instead of a continuous line across the whole range.
+      # Canary (green, alternate target group) share of total requests,
+      # computed from raw request counts so it reflects real traffic, not
+      # just the deployment's configured canary_percent (which only names
+      # the *target* for the hold phase, not what's measured live). Per AWS's
+      # own canary deployment model, the green/new revision always runs in
+      # the alternate target group during the rollout — the "original"
+      # target group (primary here) keeps the stable revision and the
+      # majority of traffic. See:
+      # https://docs.aws.amazon.com/AmazonECS/latest/developerguide/canary-deployment.html
+      #
+      # FILL(..., 0) turns "no datapoint this period" into an explicit zero —
+      # without it, CloudWatch leaves a gap (null / null is null, not 0)
+      # instead of a continuous line across the whole range.
       #
       # stacked=true renders a filled area under the line instead of a bare
-      # line, which is what removes the crossing/flickering look. Only one
-      # series is plotted here (alt_pct, the new revision's share): since
-      # CloudWatch's "stacked" mode literally sums each series' value on top
-      # of the previous one, plotting both alt_pct and primary_pct together
-      # would stack 100% on top of 100% and blow past the 0-100 axis instead
-      # of reading as a clean percentage split. With a single stacked series
-      # capped at yAxis max=100, the filled area *is* "new revision %" and
-      # the empty space above it *is* "current revision %" — one glance
-      # tells you the split without two lines crossing each other.
+      # line, which is what removes the crossing/flickering look you get
+      # from plotting two lines that add up to 100 and cross every time the
+      # split moves. Only one series is stacked here (canary_pct): stacking
+      # both canary_pct and stable_pct together would sum 100 on top of 100
+      # and blow past the 0-100 axis instead of reading as a clean split.
+      # With a single stacked series capped at yAxis max=100, the filled
+      # area *is* the canary's share and the empty space above it *is* the
+      # stable revision's share.
+      #
+      # The right-hand axis overlays the app's own per-version EMF counters
+      # (Version dimension, unchanged in app/src/metrics.js) as plain lines,
+      # so this widget answers both questions at once: "what % is on the
+      # canary right now" and "which APP_VERSION strings are actually
+      # serving" — a bare % number doesn't say whether the canary is 1.0.1 or
+      # 1.0.5, this does.
       {
         type   = "metric"
         x      = 0
@@ -163,25 +176,32 @@ resource "aws_cloudwatch_dashboard" "canary" {
         width  = 24
         height = 6
         properties = {
-          title   = "Traffic distribution: % of requests on the new revision"
+          title   = "Canary traffic shift: % of requests on the canary (green) revision, by APP_VERSION"
           region  = var.aws_region
           view    = "timeSeries"
           stacked = true
           period  = 60
           stat    = "Sum"
           yAxis = {
-            left = { min = 0, max = 100, label = "% of total requests" }
+            left  = { min = 0, max = 100, label = "% of total requests (canary share)" }
+            right = { min = 0, label = "requests / min, by APP_VERSION" }
+          }
+          annotations = {
+            horizontal = [
+              { label = "configured canary_percent", value = var.canary_percent, color = "#94a3b8", yAxis = "left" },
+            ]
           }
           metrics = [
             ["AWS/ApplicationELB", "RequestCount", "TargetGroup", aws_lb_target_group.primary.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix,
-              { id = "primary_requests_raw", visible = false }
+              { id = "stable_requests_raw", visible = false }
             ],
             ["AWS/ApplicationELB", "RequestCount", "TargetGroup", aws_lb_target_group.alternate.arn_suffix, "LoadBalancer", aws_lb.this.arn_suffix,
-              { id = "alternate_requests_raw", visible = false }
+              { id = "canary_requests_raw", visible = false }
             ],
-            [{ expression = "FILL(primary_requests_raw, 0)", label = "primary_requests", id = "primary_requests", visible = false }],
-            [{ expression = "FILL(alternate_requests_raw, 0)", label = "alternate_requests", id = "alternate_requests", visible = false }],
-            [{ expression = "IF(primary_requests + alternate_requests > 0, 100 * alternate_requests / (primary_requests + alternate_requests), 0)", label = "new revision % (filled area) — rest of the axis is the current revision", id = "alt_pct", color = "#f472b6" }],
+            [{ expression = "FILL(stable_requests_raw, 0)", label = "stable_requests", id = "stable_requests", visible = false }],
+            [{ expression = "FILL(canary_requests_raw, 0)", label = "canary_requests", id = "canary_requests", visible = false }],
+            [{ expression = "IF(stable_requests + canary_requests > 0, 100 * canary_requests / (stable_requests + canary_requests), 0)", label = "canary % (filled area) — rest of the axis is the stable revision", id = "canary_pct", color = "#f472b6" }],
+            [{ expression = "SEARCH('{${var.metrics_namespace},Version} MetricName=\"RequestCount\"', 'Sum', 60)", label = "", id = "requestsByVersion", yAxis = "right" }],
           ]
         }
       },
