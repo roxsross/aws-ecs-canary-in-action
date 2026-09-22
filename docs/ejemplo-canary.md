@@ -124,15 +124,47 @@ terraform output cloudwatch_dashboard_url   # dashboard de CloudWatch
 
 ### 2.2 Meter la canary (rollout nativo de ECS)
 
-Disparás un rollout a una versión nueva. Reusamos la misma imagen y solo
-subimos el `APP_VERSION` reportado (para un cambio de código real sería
-`make push TAG=v2` y `--tag v2`):
+Hay dos formas de disparar el rollout, según qué tan "real" quieras el ejemplo.
+
+**Opción A — rápida (solo etiqueta).** Reusás la misma imagen `v1` y solo subís
+el `APP_VERSION` que reporta. Sirve para practicar el flujo de tráfico y la
+inyección de latencia sin reconstruir nada:
 
 ```bash
 ./scripts/canary-deploy.sh --tag v1 --version 1.1.0
 ```
 
-A partir de acá ECS maneja todo, en este orden:
+**Opción B — cambio de código real (recomendada para una demo).** Construís una
+imagen `v2` distinta. El orden importa: la imagen `v1` (la estable, del paso
+2.1) ya tiene que estar construida **antes** de editar, para que `v1` y `v2`
+difieran de verdad.
+
+```bash
+# 1. hacé un cambio visible en la app, por ejemplo el subtítulo del dashboard:
+#    app/public/index.html
+#      - <small>Monitor de tráfico en vivo · ...
+#      + <small>Monitor de tráfico en vivo · v2 · ...
+#    y subí la versión del paquete en app/package.json: "version": "2.0.0"
+
+# 2. construí y subí la imagen v2 (multi-arch)
+make push TAG=v2
+
+# 3. disparala como canary
+./scripts/canary-deploy.sh --tag v2 --version 2.0.0
+```
+
+> Cómo verificar cada cosa, sin engañarte:
+> - El **cambio de código** se ve en el **navegador**: refrescá el dashboard
+>   varias veces durante el canary; ~1 de cada 10 cargas la sirve una tarea `v2`
+>   y muestra el subtítulo nuevo (el HTML no viaja en `curl /api/hit`, que
+>   devuelve JSON).
+> - La **etiqueta** `2.0.0` la confirmás por `curl .../api/health` o en el
+>   dashboard de CloudWatch ("Requests by APP_VERSION"). Ojo: esa etiqueta viene
+>   de `--version`, no del código, así que por sí sola no prueba que la imagen
+>   cambió — la prueba del cambio real es lo que ves en el navegador.
+
+A partir de acá (con cualquiera de las dos opciones) ECS maneja todo, en este
+orden:
 
 1. crea la revisión nueva ("green") y espera a que esté sana,
 2. desplaza el `canary_percent` (10%) del tráfico hacia ella,
