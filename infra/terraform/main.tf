@@ -61,16 +61,18 @@ locals {
   # ADMIN_TOKEN travels as a plain env var (visible via ecs:DescribeTaskDefinition).
   # Accepted lab tradeoff — see "Seguridad" in the README before using this for real.
   #
-  # LISTENER_ARN / *_TARGET_GROUP_ARN / PRODUCTION_LISTENER_RULE_ARN: primary
-  # and alternate are not an arbitrary pair here. Per AWS's own canary/blue-
-  # green deployment model, the "original" target group (primary) always
-  # keeps the current stable revision and the majority of traffic, and the
-  # "alternate" target group always receives the new/canary revision during
-  # a rollout - confirmed live against this account's ALB while a rollout was
-  # in progress. That pairing is fixed across every deployment, so the app's
-  # live-weights reader (app/src/alb-weights.js) can point at it directly.
-  # It reads PRODUCTION_LISTENER_RULE_ARN (not the listener's default action)
-  # because that's the rule ECS actually rewrites during a rollout.
+  # LISTENER_ARN / *_TARGET_GROUP_ARN / PRODUCTION_LISTENER_RULE_ARN let the
+  # app's live-weights reader (app/src/alb-weights.js) read the real traffic
+  # split. Important: primary and alternate do NOT keep a fixed stable/canary
+  # role across deployments — confirmed live against this account by cross-
+  # checking running task definitions against target group membership on two
+  # separate rollouts: the first one put the new revision in the alternate
+  # target group, the second one put it in primary. So the app doesn't trust
+  # "primary = stable" as a label; it reads both weights and picks the larger
+  # one as stable, the smaller as canary (same fix applied to the dashboard's
+  # traffic widget and to the mirrored per-target-group alarms below).
+  # PRODUCTION_LISTENER_RULE_ARN matters because that's the rule ECS actually
+  # rewrites during a rollout, not the listener's default action.
   base_environment = [
     { name = "PROJECT_NAME", value = var.project_name },
     { name = "PORT", value = tostring(var.container_port) },
