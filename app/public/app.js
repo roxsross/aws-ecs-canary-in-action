@@ -403,10 +403,17 @@ function renderCards() {
     els[`${prefix}Latency`].textContent = `${nf.format(data.avgLatencyMs)} ms`;
     els[`${prefix}Latency`].dataset.alert = data.avgLatencyMs > 500 ? 'true' : 'false';
 
-    const tasks = new Set(
-      (stats.recent || []).filter((hit) => hit.track === track).map((hit) => hit.taskId),
-    );
-    for (const p of state.probes) if (p.track === track && p.taskId !== '?') tasks.add(p.taskId);
+    // Which requests count as "this card's": in the native ECS model roles are
+    // assigned by APP_VERSION (every task reports track=stable), so match on
+    // the slot's versions; in local/mini-alb the track itself is the identity.
+    const byVersion = stats.roleBasis === 'version';
+    const slotVersions = new Set(data.versions.map((v) => v.version));
+    const belongs = (hit) => (byVersion ? slotVersions.has(hit.version) : hit.track === track);
+    const tasks = new Set((stats.recent || []).filter(belongs).map((hit) => hit.taskId));
+    for (const p of state.probes) {
+      if (p.taskId === '?') continue;
+      if (byVersion ? slotVersions.has(p.version) : p.track === track) tasks.add(p.taskId);
+    }
     const versions = data.versions.map((v) => `v${v.version}`).join(', ');
     els[`${prefix}Tasks`].textContent = tasks.size
       ? `${tasks.size} tarea${tasks.size > 1 ? 's' : ''} vista${tasks.size > 1 ? 's' : ''}${
@@ -414,7 +421,12 @@ function renderCards() {
         }`
       : 'sin tareas vistas';
 
-    card.dataset.active = lastProbe?.track === track ? 'true' : 'false';
+    const activeHere = lastProbe
+      ? byVersion
+        ? slotVersions.has(lastProbe.version)
+        : lastProbe.track === track
+      : false;
+    card.dataset.active = activeHere ? 'true' : 'false';
     card.dataset.idle = data.hits === 0 ? 'true' : 'false';
     renderSparkline(els[`${prefix}Spark`], stats.series, track);
   }

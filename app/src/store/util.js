@@ -75,24 +75,98 @@ function emptyChaosState() {
   };
 }
 
-function summarise(aggregates) {
+function emptyRoleSlot() {
+  return { hits: 0, errors: 0, latencySum: 0, versions: [], avgLatencyMs: 0, errorRate: 0, share: 0 };
+}
+
+// Turns an accumulated {hits,errors,latencySum} into a card-ready slot, with a
+// single-version list so the card shows that version and its own stats.
+function finaliseSlot(v) {
+  const avg = v.hits ? v.latencySum / v.hits : 0;
+  return {
+    hits: v.hits,
+    errors: v.errors,
+    latencySum: v.latencySum,
+    versions: [{ version: v.version, hits: v.hits, errors: v.errors, lastSeen: v.lastSeen || null }],
+    avgLatencyMs: Number(avg.toFixed(avg < 10 ? 2 : 0)),
+    errorRate: v.hits ? Number(((v.errors / v.hits) * 100).toFixed(2)) : 0,
+    share: 0,
+  };
+}
+
+// AWS native-canary mode: every task reports track=stable (there is no fixed
+// "canary" service to set TRACK=canary), so the real differentiator between
+// the running revisions is APP_VERSION, not track. Re-derives the two card
+// slots from the versions actually serving right now — identified by presence
+// in the recent hit feed, falling back to the most recent lastSeen — instead
+// of piling every version ever seen onto "stable" (which also made the stable
+// card show the highest all-time version, e.g. the long-retired 1.0.1, rather
+// than what's live). The version taking the majority of recent traffic is the
+// stable role; the minority one, present only during a rollout, is the canary.
+function rolesByVersion(aggregates, recentHits) {
+  const byVersion = new Map();
+  for (const row of aggregates) {
+    if (!row.version) continue;
+    const slot = byVersion.get(row.version) || {
+      version: row.version,
+      hits: 0,
+      errors: 0,
+      latencySum: 0,
+      lastSeen: null,
+    };
+    slot.hits += Number(row.hits || 0);
+    slot.errors += Number(row.errors || 0);
+    slot.latencySum += Number(row.latencySum || 0);
+    if (row.lastSeen && (!slot.lastSeen || row.lastSeen > slot.lastSeen)) slot.lastSeen = row.lastSeen;
+    byVersion.set(row.version, slot);
+  }
+  if (byVersion.size === 0) return null;
+
+  const recentByVersion = new Map();
+  for (const hit of recentHits || []) {
+    if (!hit || !hit.version) continue;
+    recentByVersion.set(hit.version, (recentByVersion.get(hit.version) || 0) + 1);
+  }
+
+  let ranked;
+  if (recentByVersion.size > 0) {
+    // Currently-serving versions, ordered by their share of recent traffic.
+    ranked = [...byVersion.values()]
+      .filter((v) => recentByVersion.has(v.version))
+      .sort((a, b) => (recentByVersion.get(b.version) || 0) - (recentByVersion.get(a.version) || 0));
+  } else {
+    // No recent feed (quiet period): fall back to whichever version was seen last.
+    ranked = [...byVersion.values()].sort((a, b) =>
+      String(b.lastSeen || '').localeCompare(String(a.lastSeen || '')),
+    );
+  }
+  if (ranked.length === 0) ranked = [...byVersion.values()].sort((a, b) => b.hits - a.hits);
+
+  return {
+    stable: finaliseSlot(ranked[0]),
+    canary: ranked[1] ? finaliseSlot(ranked[1]) : emptyRoleSlot(),
+  };
+}
+
+function summarise(aggregates, recentHits = []) {
   const totals = { hits: 0, errors: 0 };
-  const byTrack = {
+  let byTrack = {
     stable: { hits: 0, errors: 0, latencySum: 0, versions: [] },
     canary: { hits: 0, errors: 0, latencySum: 0, versions: [] },
   };
   for (const row of aggregates) {
     const slot = byTrack[row.track];
-    if (!slot) continue;
-    slot.hits += Number(row.hits || 0);
-    slot.errors += Number(row.errors || 0);
-    slot.latencySum += Number(row.latencySum || 0);
-    slot.versions.push({
-      version: row.version,
-      hits: Number(row.hits || 0),
-      errors: Number(row.errors || 0),
-      lastSeen: row.lastSeen || null,
-    });
+    if (slot) {
+      slot.hits += Number(row.hits || 0);
+      slot.errors += Number(row.errors || 0);
+      slot.latencySum += Number(row.latencySum || 0);
+      slot.versions.push({
+        version: row.version,
+        hits: Number(row.hits || 0),
+        errors: Number(row.errors || 0),
+        lastSeen: row.lastSeen || null,
+      });
+    }
     totals.hits += Number(row.hits || 0);
     totals.errors += Number(row.errors || 0);
   }
@@ -105,12 +179,31 @@ function summarise(aggregates) {
     slot.share = 0;
     slot.versions.sort((a, b) => b.hits - a.hits);
   }
-  if (totals.hits > 0) {
-    byTrack.stable.share = Number(((byTrack.stable.hits / totals.hits) * 100).toFixed(1));
+
+  // When no task ever reported track=canary (the native ECS model, where the
+  // canary is a new APP_VERSION rather than a separate service), roles come
+  // from the versions, not the track. Local/mini-alb, which does run a real
+  // canary service, keeps the track-based grouping untouched. roleBasis tells
+  // the frontend which identity to group recent-task lists by.
+  const hasCanaryTrack = aggregates.some((row) => row.track === 'canary' && Number(row.hits) > 0);
+  let roleBasis = 'track';
+  if (!hasCanaryTrack) {
+    const roled = rolesByVersion(aggregates, recentHits);
+    if (roled) {
+      byTrack = roled;
+      roleBasis = 'version';
+    }
+  }
+
+  // Share is the split between the two slots (in local mode stable+canary is
+  // the whole population, so this matches the old totals-based definition).
+  const pairHits = byTrack.stable.hits + byTrack.canary.hits;
+  if (pairHits > 0) {
+    byTrack.stable.share = Number(((byTrack.stable.hits / pairHits) * 100).toFixed(1));
     byTrack.canary.share = Number((100 - byTrack.stable.share).toFixed(1));
   }
   totals.errorRate = totals.hits ? Number(((totals.errors / totals.hits) * 100).toFixed(2)) : 0;
-  return { totals, byTrack };
+  return { totals, byTrack, roleBasis };
 }
 
 module.exports = {

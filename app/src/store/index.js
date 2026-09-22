@@ -104,13 +104,14 @@ function decorate(store, shadow, config) {
       store.getRecent(recent),
       store.getChaos(),
     ]);
-    const { totals, byTrack } = summarise(aggregates);
+    const { totals, byTrack, roleBasis } = summarise(aggregates, recentHits);
     return {
       generatedAt: new Date().toISOString(),
       persistence: store.health(),
       window: { minutes },
       totals,
       tracks: byTrack,
+      roleBasis,
       series,
       recent: recentHits,
       chaos,

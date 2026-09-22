@@ -279,11 +279,11 @@ resource "aws_cloudwatch_dashboard" "canary" {
       {
         type   = "metric"
         x      = 0
-        y      = 6
+        y      = 12
         width  = 12
         height = 6
         properties = {
-          title  = "Requests per target group"
+          title  = "Requests per target group (physical — roles swap per deploy)"
           region = var.aws_region
           view   = "timeSeries"
           period = 60
@@ -297,11 +297,11 @@ resource "aws_cloudwatch_dashboard" "canary" {
       {
         type   = "metric"
         x      = 12
-        y      = 6
+        y      = 12
         width  = 12
         height = 6
         properties = {
-          title  = "5xx per target group"
+          title  = "5xx per target group (physical)"
           region = var.aws_region
           view   = "timeSeries"
           period = 60
@@ -320,11 +320,11 @@ resource "aws_cloudwatch_dashboard" "canary" {
       {
         type   = "metric"
         x      = 0
-        y      = 12
+        y      = 18
         width  = 12
         height = 6
         properties = {
-          title  = "p95 latency per target group"
+          title  = "p95 latency per target group (physical)"
           region = var.aws_region
           view   = "timeSeries"
           period = 60
@@ -343,11 +343,11 @@ resource "aws_cloudwatch_dashboard" "canary" {
       {
         type   = "metric"
         x      = 12
-        y      = 12
+        y      = 18
         width  = 12
         height = 6
         properties = {
-          title  = "Healthy targets"
+          title  = "Healthy targets (physical)"
           region = var.aws_region
           view   = "timeSeries"
           period = 60
@@ -363,7 +363,7 @@ resource "aws_cloudwatch_dashboard" "canary" {
       {
         type   = "metric"
         x      = 0
-        y      = 18
+        y      = 6
         width  = 12
         height = 6
         properties = {
@@ -375,7 +375,10 @@ resource "aws_cloudwatch_dashboard" "canary" {
           # SEARCH discovers one series per distinct Version dimension value
           # the app has actually emitted, so the legend shows the real
           # APP_VERSION strings running right now, not a static "primary" /
-          # "alternate" label that doesn't say which version that is.
+          # "alternate" label that doesn't say which version that is. This is
+          # the view that actually answers "which revision is which" — the
+          # per-target-group widgets below are the physical plumbing, whose
+          # stable/canary roles swap between deployments.
           metrics = [
             [{ expression = "SEARCH('{${var.metrics_namespace},Version} MetricName=\"RequestCount\"', 'Sum', 60)", id = "requestsByVersion" }],
           ]
@@ -384,7 +387,7 @@ resource "aws_cloudwatch_dashboard" "canary" {
       {
         type   = "metric"
         x      = 12
-        y      = 18
+        y      = 6
         width  = 12
         height = 6
         properties = {
